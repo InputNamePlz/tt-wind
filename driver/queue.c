@@ -153,6 +153,10 @@ TtWindEvtIoDeviceControl(
         status = TtWindIoctlResetDevice(device, Request);
         break;
 
+    case IOCTL_TTWIND_ARC_STATUS:
+        status = TtWindIoctlArcStatus(device, Request, &bytesWritten);
+        break;
+
     default:
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;

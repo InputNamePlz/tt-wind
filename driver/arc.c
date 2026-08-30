@@ -32,6 +32,35 @@
  *    of any queue pointer means the device is gone or the NOC path is
  *    hung (msgqueue.c:27-38).
  *
+ * ARC XBAR NOC window (why every ARC NOC address carries ArcNocBase):
+ * the scratch registers, CSM, and doorbell all live in the ARC tile's
+ * XBAR address space (32-bit: CSM at 0x10000000, APB at 0x80030400,
+ * doorbell at 0x800B0000). How that space appears in the tile's
+ * NOC-side 64-bit address map has two candidates:
+ *  - the LOW ALIAS: NOC address == XBAR address. This is what tt-kmd
+ *    uses on Blackhole (blackhole.c:62-68) and what tt-umd's Blackhole
+ *    NOC fallback uses (blackhole_arc_apb.cpp:45-48 with
+ *    ARC_NOC_XBAR_ADDRESS_START = 0x80000000).
+ *  - the HIGH WINDOW at 0x8_00000000 + XBAR address. On Wormhole this
+ *    is the ONLY way to reach the ARC over the NOC
+ *    (tt-umd wormhole_implementation.hpp:292-297, 308-312: NOC access
+ *    = ARC_NOC_ADDRESS_START 0x800000000 + XBAR offset; scratch =
+ *    0x880030060; exercised by test_cluster_wh.cpp:1060-1084), and
+ *    tt-umd declares the same window for Blackhole as
+ *    ARC_NOC_TO_ARC_XBAR_MAP_ADDRESS_START = 0x800000000
+ *    (blackhole_implementation.hpp:235), though its Blackhole code
+ *    paths do not use it.
+ * On this machine's card, every read through the low alias returns
+ * 0x00000000 (boot status, QCB pointer, arbitrary XBAR addresses) while
+ * the same TLB path reads Tensix tiles correctly - the signature of an
+ * unmapped region reading as zero, i.e. firmware/silicon here does not
+ * expose the low alias. Discovery therefore probes the low alias first
+ * (tt-kmd behavior preserved) and falls back to the high window; the
+ * base that answers with a live boot status is cached in
+ * Ctx->ArcNocBase and applied to ALL ARC accesses uniformly. Probing is
+ * reads-only; queue writes happen only through a window that already
+ * answered.
+ *
  * All kernel NOC access goes through the reserved topmost 2 MiB TLB
  * window (tt-kmd reserves the same one, blackhole.c:43, 702-703),
  * reprogrammed for each access exactly like tt-kmd's
@@ -58,16 +87,26 @@
 #define TTWIND_ARC_X 8u
 #define TTWIND_ARC_Y 0u
 
-/* Registers on the ARC tile (NOC addresses). */
-#define TTWIND_RESET_SCRATCH(n)         (0x80030400ull + ((n) * 4u))
+/* Registers on the ARC tile (32-bit ARC XBAR addresses). */
+#define TTWIND_RESET_SCRATCH(n)         (0x80030400u + ((n) * 4u))
 #define TTWIND_ARC_BOOT_STATUS          TTWIND_RESET_SCRATCH(2)
 #define TTWIND_ARC_BOOT_STATUS_READY    0x1u
 #define TTWIND_ARC_MSG_QCB_PTR          TTWIND_RESET_SCRATCH(11)
-#define TTWIND_ARC_MSI_FIFO             0x800B0000ull
+#define TTWIND_ARC_MSI_FIFO             0x800B0000u
 
 /* ARC CSM SRAM; the queue and its control block must lie inside it. */
 #define TTWIND_ARC_CSM_BASE             0x10000000u
 #define TTWIND_ARC_CSM_SIZE             (1u << 19)
+
+/*
+ * Candidate NOC window bases for the ARC XBAR (see the file header):
+ * the low alias (tt-kmd's addressing) and the Wormhole-style high
+ * window (tt-umd blackhole_implementation.hpp:235).
+ */
+static const UINT64 TtWindArcXbarBases[] = { 0x0ull, 0x800000000ull };
+#define TTWIND_ARC_XBAR_BASE_COUNT ARRAYSIZE(TtWindArcXbarBases)
+/* The ARC_STATUS report has exactly a low and a high boot-status slot. */
+C_ASSERT(ARRAYSIZE(TtWindArcXbarBases) == 2);
 
 /* Queue geometry (msgqueue.h). */
 #define TTWIND_ARC_QUEUE_HEADER_SIZE    32u
@@ -180,6 +219,31 @@ TtWindArcNocWrite32(
  * against the CSM range before use so a corrupt pointer can never send
  * the kernel's NOC access somewhere unexpected.
  */
+/*
+ * XBAR-relative accessors: XbarAddr is an address in the ARC XBAR's
+ * 32-bit space (scratch/doorbell/CSM); the NOC address is formed by
+ * adding the discovered window base. Callers hold ArcLock and run only
+ * after (or as part of) discovery, so ArcNocBase is meaningful.
+ */
+static UINT32
+TtWindArcXbarRead32(
+    _In_ PTTWIND_DEVICE_CONTEXT Ctx,
+    _In_ UINT32 XbarAddr
+    )
+{
+    return TtWindArcNocRead32(Ctx, Ctx->ArcNocBase + XbarAddr);
+}
+
+static VOID
+TtWindArcXbarWrite32(
+    _In_ PTTWIND_DEVICE_CONTEXT Ctx,
+    _In_ UINT32 XbarAddr,
+    _In_ UINT32 Value
+    )
+{
+    TtWindArcNocWrite32(Ctx, Ctx->ArcNocBase + XbarAddr, Value);
+}
+
 static NTSTATUS
 TtWindArcCsmRead32(
     _In_ PTTWIND_DEVICE_CONTEXT Ctx,
@@ -193,7 +257,7 @@ TtWindArcCsmRead32(
         (Addr & 3) != 0) {
         return STATUS_INVALID_ADDRESS;
     }
-    *Value = TtWindArcNocRead32(Ctx, Addr);
+    *Value = TtWindArcXbarRead32(Ctx, Addr);
     return STATUS_SUCCESS;
 }
 
@@ -209,51 +273,109 @@ TtWindArcCsmWrite32(
         (Addr & 3) != 0) {
         return STATUS_INVALID_ADDRESS;
     }
-    TtWindArcNocWrite32(Ctx, Addr, Value);
+    TtWindArcXbarWrite32(Ctx, Addr, Value);
     return STATUS_SUCCESS;
 }
 
 /*
- * Discover the firmware message queue: wait (bounded) for the boot
- * status ready bit, then read the queue control block. Mirrors
- * blackhole_arc_msg_locate_queue (blackhole.c:566-597). Caller holds
+ * Discover the firmware message queue. Mirrors
+ * blackhole_arc_msg_locate_queue (blackhole.c:566-597) with one
+ * addition: the ARC XBAR NOC window base is probed (see the file
+ * header). Each candidate window's boot status is read each poll
+ * round; the first window returning a live value with the ready bit
+ * wins and is cached in Ctx->ArcNocBase for all subsequent traffic.
+ * A cached base is re-verified for free, since the winning probe read
+ * IS the boot-status check.
+ *
+ * Report, when non-NULL, receives the raw observations for the
+ * ARC_STATUS diagnostic ioctl (boot status per window, QCB pointer,
+ * decoded queue); its Stage/LastStatus are filled by the caller.
+ *
+ * Waits are bounded (500 ms, tt-kmd's ARC_MSG_READY_MS). Caller holds
  * ArcLock.
  */
 static NTSTATUS
 TtWindArcLocateQueue(
     _In_ PTTWIND_DEVICE_CONTEXT Ctx,
     _Out_ UINT32 *QueueBase,
-    _Out_ UINT32 *NumEntries
+    _Out_ UINT32 *NumEntries,
+    _Inout_opt_ TTWIND_ARC_STATUS_OUT *Report
     )
 {
     UINT64 deadline = TtWindArcDeadline(TTWIND_ARC_READY_TIMEOUT_MS);
-    UINT32 bootStatus;
+    UINT32 bootStatus[TTWIND_ARC_XBAR_BASE_COUNT] = { 0 };
+    BOOLEAN found = FALSE;
+    BOOLEAN allDead;
     UINT32 qcbAddr;
     UINT32 base;
     UINT32 queueInfo;
+    ULONG i;
     NTSTATUS status;
 
     *QueueBase = 0;
     *NumEntries = 0;
 
     for (;;) {
-        bootStatus = TtWindArcNocRead32(Ctx, TTWIND_ARC_BOOT_STATUS);
-        if (bootStatus == 0xFFFFFFFFu) {
-            /* NOC path hung or device gone. */
-            return STATUS_DEVICE_DOES_NOT_EXIST;
+        allDead = TRUE;
+
+        /*
+         * Probe both windows each round (two 32-bit reads); which one
+         * answers is a fixed property of the silicon/firmware, so a
+         * fixed probe order is deterministic and the cache never
+         * flip-flops.
+         */
+        for (i = 0; i < TTWIND_ARC_XBAR_BASE_COUNT; i++) {
+            const UINT64 candidate = TtWindArcXbarBases[i];
+
+            bootStatus[i] = TtWindArcNocRead32(
+                Ctx, candidate + TTWIND_ARC_BOOT_STATUS);
+
+            if (bootStatus[i] != 0xFFFFFFFFu) {
+                allDead = FALSE;
+            }
+            if (bootStatus[i] != 0xFFFFFFFFu &&
+                (bootStatus[i] & TTWIND_ARC_BOOT_STATUS_READY)) {
+                if (!Ctx->ArcNocBaseValid || Ctx->ArcNocBase != candidate) {
+                    KdPrint(("ttwind: ARC XBAR NOC window base "
+                             "0x%I64X (boot status 0x%08X)\n",
+                             candidate, bootStatus[i]));
+                }
+                Ctx->ArcNocBase = candidate;
+                Ctx->ArcNocBaseValid = TRUE;
+                found = TRUE;
+                break;
+            }
         }
-        if (bootStatus & TTWIND_ARC_BOOT_STATUS_READY) {
+
+        if (Report != NULL) {
+            Report->BootStatusLow = bootStatus[0];
+            Report->BootStatusHigh = bootStatus[1];
+        }
+
+        if (found) {
             break;
+        }
+        if (allDead) {
+            /* Every window reads all-1s: NOC hung or device gone. */
+            return STATUS_DEVICE_DOES_NOT_EXIST;
         }
         if (TtWindArcPastDeadline(deadline)) {
             KdPrint(("ttwind: ARC not ready for messages (boot status "
-                     "0x%08X)\n", bootStatus));
+                     "low 0x%08X high 0x%08X)\n",
+                     bootStatus[0], bootStatus[1]));
             return STATUS_DEVICE_NOT_READY;
         }
         TtWindArcStall(200);
     }
 
-    qcbAddr = TtWindArcNocRead32(Ctx, TTWIND_ARC_MSG_QCB_PTR);
+    if (Report != NULL) {
+        Report->NocBase = Ctx->ArcNocBase;
+    }
+
+    qcbAddr = TtWindArcXbarRead32(Ctx, TTWIND_ARC_MSG_QCB_PTR);
+    if (Report != NULL) {
+        Report->QcbPtr = qcbAddr;
+    }
 
     status = TtWindArcCsmRead32(Ctx, qcbAddr + 0, &base);
     if (!NT_SUCCESS(status)) {
@@ -266,6 +388,11 @@ TtWindArcLocateQueue(
 
     *QueueBase = base;
     *NumEntries = queueInfo & 0xFFu;
+
+    if (Report != NULL) {
+        Report->QueueBase = base;
+        Report->NumEntries = *NumEntries;
+    }
 
     /* A zero-length queue would divide by zero in the ring math. */
     if (*NumEntries == 0) {
@@ -438,7 +565,7 @@ TtWindArcMsgSendSync(
         goto out;
     }
 
-    status = TtWindArcLocateQueue(ctx, &queueBase, &numEntries);
+    status = TtWindArcLocateQueue(ctx, &queueBase, &numEntries, NULL);
     if (!NT_SUCCESS(status)) {
         goto out;
     }
@@ -461,7 +588,7 @@ TtWindArcMsgSendSync(
     }
 
     /* Ring the doorbell: the firmware's queue processor runs on this. */
-    TtWindArcNocWrite32(ctx, TTWIND_ARC_MSI_FIFO, 0);
+    TtWindArcXbarWrite32(ctx, TTWIND_ARC_MSI_FIFO, 0);
 
     deadline = TtWindArcDeadline(TTWIND_ARC_MSG_TIMEOUT_MS);
     for (;;) {
@@ -672,6 +799,62 @@ TtWindIoctlSmcMsg(
         out->Message[i + 1] = msg.Payload[i];
     }
 
+    *BytesWritten = sizeof(*out);
+    return STATUS_SUCCESS;
+}
+
+/*
+ * Handler for IOCTL_TTWIND_ARC_STATUS - one live, bounded discovery
+ * probe, reported raw. Reads only; always succeeds once the buffers
+ * check out, with the outcome in the payload (see ttwind_ioctl.h).
+ */
+NTSTATUS
+TtWindIoctlArcStatus(
+    _In_ WDFDEVICE Device,
+    _In_ WDFREQUEST Request,
+    _Out_ size_t *BytesWritten
+    )
+{
+    PTTWIND_DEVICE_CONTEXT ctx = TtWindGetDeviceContext(Device);
+    TTWIND_ARC_STATUS_OUT *out;
+    TTWIND_ARC_STATUS_OUT report;
+    UINT32 queueBase = 0;
+    UINT32 numEntries = 0;
+    NTSTATUS status;
+
+    *BytesWritten = 0;
+
+    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out),
+                                            (PVOID *)&out, NULL);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    RtlZeroMemory(&report, sizeof(report));
+    report.NocBase = ~0ull;
+
+    WdfWaitLockAcquire(ctx->ArcLock, NULL);
+
+    if (ctx->KernelTlb == NULL || ctx->TlbRegs == NULL) {
+        report.Stage = TTWIND_ARC_STAGE_NOT_STARTED;
+        report.LastStatus = (unsigned int)STATUS_DEVICE_NOT_READY;
+    } else {
+        status = TtWindArcLocateQueue(ctx, &queueBase, &numEntries,
+                                      &report);
+        report.LastStatus = (unsigned int)status;
+        if (NT_SUCCESS(status)) {
+            report.Stage = TTWIND_ARC_STAGE_QUEUE_OK;
+        } else if (report.NocBase != ~0ull) {
+            /* A window answered ready, but the queue didn't check out. */
+            report.Stage = TTWIND_ARC_STAGE_BAD_QUEUE;
+        } else {
+            report.Stage = TTWIND_ARC_STAGE_NO_BOOT_READY;
+        }
+    }
+
+    WdfWaitLockRelease(ctx->ArcLock);
+
+    *out = report;
     *BytesWritten = sizeof(*out);
     return STATUS_SUCCESS;
 }

@@ -127,6 +127,15 @@ typedef struct _TTWIND_DEVICE_CONTEXT {
     WDFWAITLOCK ArcLock;
 
     /*
+     * NOC window base through which the ARC XBAR (scratch, CSM,
+     * doorbell) answers on this card: 0 (tt-kmd's low alias) or
+     * 0x800000000 (the Wormhole-style high window). Discovered by
+     * probing at queue-location time; guarded by ArcLock.
+     */
+    UINT64  ArcNocBase;
+    BOOLEAN ArcNocBaseValid;
+
+    /*
      * Config-space access to this function via the parent bus driver.
      * Queried (referenced) at PrepareHardware, dereferenced at
      * ReleaseHardware. Valid only while BusIfValid.
@@ -193,6 +202,8 @@ NTSTATUS TtWindArcPowerUp(_In_ WDFDEVICE Device);
 VOID TtWindArcPowerDown(_In_ WDFDEVICE Device);
 NTSTATUS TtWindIoctlSmcMsg(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request,
                            _Out_ size_t *BytesWritten);
+NTSTATUS TtWindIoctlArcStatus(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request,
+                              _Out_ size_t *BytesWritten);
 
 /* reset.c */
 NTSTATUS TtWindIoctlResetDevice(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request);

@@ -17,6 +17,9 @@
  *                          the window, print it, unmap, free.
  *   arcmsg <hdr> [w1..w7]  Send a raw 8x u32 ARC (SMC) firmware message
  *                          (missing words are 0), print the response.
+ *   arcstatus              Run one ARC discovery probe and print the raw
+ *                          observations (boot status via both candidate
+ *                          NOC windows, QCB pointer, queue geometry).
  *   reset                  IOCTL_TTWIND_RESET_DEVICE (refused while any
  *                          user mapping exists).
  * Numeric arguments accept 0x-prefixed hex.
@@ -416,6 +419,57 @@ out_close:
 }
 
 /*
+ * arcstatus: IOCTL_TTWIND_ARC_STATUS - one live, bounded discovery
+ * probe, printed raw. Safe: reads only.
+ */
+static int cmd_arcstatus(void)
+{
+    static const char *const stage_names[] = {
+        "0 (device not started)",
+        "1 (no window showed boot-ready)",
+        "2 (ready, but queue control block/queue invalid)",
+        "3 (message queue located)",
+    };
+    TTWIND_ARC_STATUS_OUT st;
+    DWORD returned = 0;
+    HANDLE h;
+    int rc = 2;
+
+    h = open_first_device();
+    if (h == INVALID_HANDLE_VALUE)
+        return 2;
+
+    if (!DeviceIoControl(h, IOCTL_TTWIND_ARC_STATUS, NULL, 0,
+                         &st, sizeof(st), &returned, NULL)) {
+        print_win32_error("ARC_STATUS failed", GetLastError());
+        goto out_close;
+    }
+    if (returned < sizeof(st)) {
+        fprintf(stderr, "short ARC_STATUS reply: %lu bytes\n", returned);
+        goto out_close;
+    }
+
+    printf("Stage           : %s\n",
+           st.Stage < 4 ? stage_names[st.Stage] : "?");
+    printf("Probe NTSTATUS  : 0x%08x\n", st.LastStatus);
+    printf("Boot status     : low-alias(base 0x0)=0x%08x  "
+           "high-window(base 0x800000000)=0x%08x\n",
+           st.BootStatusLow, st.BootStatusHigh);
+    if (st.NocBase == ~0ull)
+        printf("Selected window : none\n");
+    else
+        printf("Selected window : NOC base 0x%llx\n", st.NocBase);
+    printf("QCB pointer     : 0x%08x\n", st.QcbPtr);
+    printf("Queue           : base 0x%08x, %u entries\n",
+           st.QueueBase, st.NumEntries);
+    rc = (st.Stage == TTWIND_ARC_STAGE_QUEUE_OK) ? 0 : 1;
+
+out_close:
+    CloseHandle(h);
+    return rc;
+}
+
+/*
  * reset: IOCTL_TTWIND_RESET_DEVICE. The driver refuses with
  * ERROR_BUSY while any user mapping of device memory exists; the call
  * blocks (up to ~15 s worst case) while the device resets, config
@@ -453,6 +507,7 @@ static int usage(void)
             "       ttwind-info bar0read <offset>     read u32 from BAR0\n"
             "       ttwind-info tlbread <x> <y> <addr> read u32 via TLB window\n"
             "       ttwind-info arcmsg <hdr> [w1..w7] send raw ARC/SMC message\n"
+            "       ttwind-info arcstatus             probe ARC queue discovery\n"
             "       ttwind-info reset                 reset the device\n");
     return 2;
 }
@@ -470,6 +525,8 @@ int main(int argc, char **argv)
             return cmd_tlbread(argv[2], argv[3], argv[4]);
         if (strcmp(argv[1], "arcmsg") == 0 && argc >= 3 && argc <= 10)
             return cmd_arcmsg(argc - 2, argv + 2);
+        if (strcmp(argv[1], "arcstatus") == 0 && argc == 2)
+            return cmd_arcstatus();
         if (strcmp(argv[1], "reset") == 0 && argc == 2)
             return cmd_reset();
         return usage();

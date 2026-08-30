@@ -57,6 +57,8 @@ DEFINE_GUID(GUID_DEVINTERFACE_TTWIND,
     CTL_CODE(TTWIND_DEVICE_TYPE, 0x807, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_TTWIND_RESET_DEVICE \
     CTL_CODE(TTWIND_DEVICE_TYPE, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_TTWIND_ARC_STATUS \
+    CTL_CODE(TTWIND_DEVICE_TYPE, 0x809, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 /* A PCI device decodes at most six 32-bit BARs. */
 #define TTWIND_MAX_BARS 6u
@@ -276,6 +278,48 @@ typedef struct _TTWIND_RESET_DEVICE_IN {
     unsigned int Reserved;       /* must be 0 */
 } TTWIND_RESET_DEVICE_IN;
 
+/*
+ * Output of IOCTL_TTWIND_ARC_STATUS. No input buffer.
+ *
+ * Diagnostic: performs one live, bounded ARC message-queue discovery
+ * probe and reports what it observed. Read-only on the device (NOC
+ * reads of the ARC tile only); always completes with STATUS_SUCCESS
+ * when the device is started - the outcome is in the payload.
+ *
+ * The ARC XBAR (scratch registers, CSM, doorbell) is probed through two
+ * candidate NOC windows on tile (8,0): the low alias used by tt-kmd
+ * (NOC address == XBAR address, e.g. boot status at 0x80030408) and the
+ * high window at 0x8_00000000 + XBAR address (Wormhole-style; declared
+ * for Blackhole as ARC_NOC_TO_ARC_XBAR_MAP_ADDRESS_START in tt-umd).
+ *
+ * @Stage: TTWIND_ARC_STAGE_*.
+ * @LastStatus: NTSTATUS of the probe (0 on full success).
+ * @BootStatusLow / @BootStatusHigh: raw single reads of SCRATCH_RAM_2
+ *      (boot status) through the low alias / high window.
+ * @NocBase: the ARC XBAR NOC window base the driver selected
+ *      (0 or 0x800000000); ~0 if discovery never succeeded.
+ * @QcbPtr: raw SCRATCH_RAM_11 (queue control block pointer) read
+ *      through the selected window; 0 if none selected.
+ * @QueueBase / @NumEntries: decoded firmware queue, when Stage is
+ *      TTWIND_ARC_STAGE_QUEUE_OK.
+ */
+#define TTWIND_ARC_STAGE_NOT_STARTED   0u /* device/hw not ready       */
+#define TTWIND_ARC_STAGE_NO_BOOT_READY 1u /* no window showed ready    */
+#define TTWIND_ARC_STAGE_BAD_QUEUE     2u /* ready, but QCB/queue bad  */
+#define TTWIND_ARC_STAGE_QUEUE_OK      3u /* queue located             */
+
+typedef struct _TTWIND_ARC_STATUS_OUT {
+    unsigned int     Stage;
+    unsigned int     LastStatus;     /* NTSTATUS of the probe          */
+    unsigned int     BootStatusLow;  /* SCRATCH_RAM_2 via low alias    */
+    unsigned int     BootStatusHigh; /* SCRATCH_RAM_2 via high window  */
+    unsigned __int64 NocBase;        /* selected window; ~0 if none    */
+    unsigned int     QcbPtr;         /* SCRATCH_RAM_11 via selection   */
+    unsigned int     QueueBase;
+    unsigned int     NumEntries;
+    unsigned int     Reserved;       /* zero */
+} TTWIND_ARC_STATUS_OUT;
+
 #ifdef __cplusplus
 static_assert(sizeof(TTWIND_DEVICE_INFO_OUT) == 120,
               "TTWIND_DEVICE_INFO_OUT wire size changed");
@@ -291,6 +335,7 @@ static_assert(sizeof(TTWIND_MAP_TLB_IN) == 8, "wire size");
 static_assert(sizeof(TTWIND_MAP_TLB_OUT) == 8, "wire size");
 static_assert(sizeof(TTWIND_SMC_MSG_INOUT) == 32, "wire size");
 static_assert(sizeof(TTWIND_RESET_DEVICE_IN) == 8, "wire size");
+static_assert(sizeof(TTWIND_ARC_STATUS_OUT) == 40, "wire size");
 #else
 C_ASSERT(sizeof(TTWIND_DEVICE_INFO_OUT) == 120);
 C_ASSERT(sizeof(TTWIND_MAP_BAR_IN) == 24);
@@ -305,4 +350,5 @@ C_ASSERT(sizeof(TTWIND_MAP_TLB_IN) == 8);
 C_ASSERT(sizeof(TTWIND_MAP_TLB_OUT) == 8);
 C_ASSERT(sizeof(TTWIND_SMC_MSG_INOUT) == 32);
 C_ASSERT(sizeof(TTWIND_RESET_DEVICE_IN) == 8);
+C_ASSERT(sizeof(TTWIND_ARC_STATUS_OUT) == 40);
 #endif
