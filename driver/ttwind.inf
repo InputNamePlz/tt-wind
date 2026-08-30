@@ -1,0 +1,64 @@
+;
+; ttwind.inf - Tenstorrent Windows kernel-mode driver (tt-wind)
+;
+; Installs the tt-wind KMDF function driver on Tenstorrent Blackhole
+; PCIe devices. SPDX-License-Identifier: Apache-2.0
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = ttwind.cat
+DriverVer   = ; stamped by stampinf at build time
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13 ; driver store
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+ttwind.sys = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...16299
+
+; DIRID 13 (run from driver store) requires Windows 10 1709 or later.
+[Standard.NT$ARCH$.10.0...16299]
+%TTWind.Blackhole.DeviceDesc% = TTWind_Device, PCI\VEN_1E52&DEV_B140
+
+[TTWind_Device.NT]
+CopyFiles = TTWind_CopyFiles
+
+[TTWind_CopyFiles]
+ttwind.sys
+
+[TTWind_Device.NT.Services]
+AddService = ttwind, %SPSVCINST_ASSOCSERVICE%, TTWind_Service_Inst
+
+[TTWind_Service_Inst]
+DisplayName   = %TTWind.SvcDesc%
+ServiceType   = 1 ; SERVICE_KERNEL_DRIVER
+StartType     = 3 ; SERVICE_DEMAND_START (started by PnP on device arrival)
+ErrorControl  = 1 ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\ttwind.sys
+
+; --- KMDF framework binding -------------------------------------------
+
+[TTWind_Device.NT.Wdf]
+KmdfService = ttwind, TTWind_wdfsect
+
+[TTWind_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+; --- Strings ----------------------------------------------------------
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName             = "Tenstorrent"
+DiskName                     = "tt-wind Installation Disk"
+TTWind.Blackhole.DeviceDesc  = "Tenstorrent Blackhole (tt-wind)"
+TTWind.SvcDesc               = "Tenstorrent tt-wind driver"
