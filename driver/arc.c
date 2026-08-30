@@ -32,34 +32,45 @@
  *    of any queue pointer means the device is gone or the NOC path is
  *    hung (msgqueue.c:27-38).
  *
- * ARC XBAR NOC window (why every ARC NOC address carries ArcNocBase):
- * the scratch registers, CSM, and doorbell all live in the ARC tile's
- * XBAR address space (32-bit: CSM at 0x10000000, APB at 0x80030400,
- * doorbell at 0x800B0000). How that space appears in the tile's
- * NOC-side 64-bit address map has two candidates:
- *  - the LOW ALIAS: NOC address == XBAR address. This is what tt-kmd
- *    uses on Blackhole (blackhole.c:62-68) and what tt-umd's Blackhole
- *    NOC fallback uses (blackhole_arc_apb.cpp:45-48 with
- *    ARC_NOC_XBAR_ADDRESS_START = 0x80000000).
- *  - the HIGH WINDOW at 0x8_00000000 + XBAR address. On Wormhole this
- *    is the ONLY way to reach the ARC over the NOC
- *    (tt-umd wormhole_implementation.hpp:292-297, 308-312: NOC access
- *    = ARC_NOC_ADDRESS_START 0x800000000 + XBAR offset; scratch =
- *    0x880030060; exercised by test_cluster_wh.cpp:1060-1084), and
- *    tt-umd declares the same window for Blackhole as
- *    ARC_NOC_TO_ARC_XBAR_MAP_ADDRESS_START = 0x800000000
- *    (blackhole_implementation.hpp:235), though its Blackhole code
- *    paths do not use it.
- * On this machine's card, every read through the low alias returns
- * 0x00000000 (boot status, QCB pointer, arbitrary XBAR addresses) while
- * the same TLB path reads Tensix tiles correctly - the signature of an
- * unmapped region reading as zero, i.e. firmware/silicon here does not
- * expose the low alias. Discovery therefore probes the low alias first
- * (tt-kmd behavior preserved) and falls back to the high window; the
- * base that answers with a live boot status is cached in
- * Ctx->ArcNocBase and applied to ALL ARC accesses uniformly. Probing is
- * reads-only; queue writes happen only through a window that already
- * answered.
+ * How the ARC's registers and memory are addressed (why there is a
+ * route probe): the protocol touches two distinct ARC resources.
+ *
+ * 1. The CSM SRAM (the message rings and queue control block), 32-bit
+ *    addresses 0x10000000..+512K. It is reached over the NOC at its
+ *    plain address (NOC address == CSM address) - tt-kmd's addressing
+ *    (blackhole.c:328-344 with telemetry.h:82-83), and verified on
+ *    this hardware (a NOC0 (8,0) read of 0x10000100 returns live CSM
+ *    data). CSM access is therefore always NOC, low alias.
+ *
+ * 2. The APB block (reset-unit scratch registers at APB offset
+ *    0x304xx, the doorbells) has THREE known routes, and which ones
+ *    decode varies with board/firmware - on this machine's card both
+ *    NOC routes read as zero while the same TLB path reads Tensix
+ *    tiles and CSM correctly, so the aperture route matters:
+ *     a. NOC low alias: NOC address = 0x80000000 + APB offset. What
+ *        tt-kmd uses (blackhole.c:62-68, scratch at 0x80030400+4N) and
+ *        tt-umd's Blackhole NOC fallback (blackhole_arc_apb.cpp:45-48,
+ *        ARC_NOC_XBAR_ADDRESS_START = 0x80000000 +
+ *        SCRATCH_RAM_N 0x304xx, blackhole_implementation.hpp:234,244).
+ *     b. NOC high window: NOC address = 0x8_80000000 + APB offset.
+ *        Wormhole's ARC-over-NOC addressing (scratch at 0x880030060,
+ *        wormhole_implementation.hpp:292-312,
+ *        test_cluster_wh.cpp:1060-1084); Blackhole declares the
+ *        matching 0x8_00000000 XBAR map base as
+ *        ARC_NOC_TO_ARC_XBAR_MAP_ADDRESS_START
+ *        (blackhole_implementation.hpp:235).
+ *     c. BAR0 AXI aperture: BAR0 offset 0x1FF00000 + APB offset, no
+ *        NOC at all. This is what tt-umd's read_from_arc_apb actually
+ *        uses over PCIe where available (blackhole_tt_device.cpp:
+ *        252-271, ARC_APB_BAR0_XBAR_OFFSET_START = 0x1FF00000,
+ *        blackhole_implementation.hpp:219) - e.g. the boot-status wait
+ *        at blackhole_tt_device.cpp:190-220. tt-umd gates it on the
+ *        PCIe tile's x-coordinate (blackhole_arc_apb.cpp:74-76); the
+ *        probe below makes that gating moot by just trying it.
+ * Discovery probes a->b->c with reads only and selects the first route
+ * whose boot status answers with the ready bit; the choice is cached
+ * in Ctx->ArcRoute and used for every APB access. APB writes (doorbell)
+ * happen only through a route that already answered.
  *
  * All kernel NOC access goes through the reserved topmost 2 MiB TLB
  * window (tt-kmd reserves the same one, blackhole.c:43, 702-703),
@@ -87,26 +98,46 @@
 #define TTWIND_ARC_X 8u
 #define TTWIND_ARC_Y 0u
 
-/* Registers on the ARC tile (32-bit ARC XBAR addresses). */
-#define TTWIND_RESET_SCRATCH(n)         (0x80030400u + ((n) * 4u))
-#define TTWIND_ARC_BOOT_STATUS          TTWIND_RESET_SCRATCH(2)
+/*
+ * APB-relative register offsets (add a route base; see file header).
+ * Scratch bank per tt-umd SCRATCH_RAM_N = 0x30400 + 4N
+ * (blackhole_implementation.hpp:244,257-265), matching tt-kmd's
+ * RESET_SCRATCH(N) = 0x80030400 + 4N less the 0x80000000 window base.
+ */
+#define TTWIND_ARC_APB_SCRATCH(n)       (0x30400u + ((n) * 4u))
+#define TTWIND_ARC_BOOT_STATUS          TTWIND_ARC_APB_SCRATCH(2)
 #define TTWIND_ARC_BOOT_STATUS_READY    0x1u
-#define TTWIND_ARC_MSG_QCB_PTR          TTWIND_RESET_SCRATCH(11)
-#define TTWIND_ARC_MSI_FIFO             0x800B0000u
+#define TTWIND_ARC_MSG_QCB_PTR          TTWIND_ARC_APB_SCRATCH(11)
+
+/*
+ * Doorbells that make the firmware service the message queue. On the
+ * NOC routes: tt-kmd's MSI FIFO, XBAR address 0x800B0000 = APB offset
+ * 0xB0000, written with 0 (blackhole.c:68, 599-604). On the AXI route:
+ * tt-umd's ARC_MISC_CNTL IRQ0 trigger, APB offset 0x30100 written with
+ * 1<<16 (blackhole_implementation.hpp:252-253 ARC_FW_INT_ADDR/VAL,
+ * used route-independently by blackhole_arc_message_queue.cpp:64-66) -
+ * each route uses the doorbell its reference implementation validated.
+ */
+#define TTWIND_ARC_MSI_FIFO             0xB0000u
+#define TTWIND_ARC_MISC_CNTL            0x30100u
+#define TTWIND_ARC_MISC_CNTL_IRQ0       (1u << 16)
 
 /* ARC CSM SRAM; the queue and its control block must lie inside it. */
 #define TTWIND_ARC_CSM_BASE             0x10000000u
 #define TTWIND_ARC_CSM_SIZE             (1u << 19)
 
-/*
- * Candidate NOC window bases for the ARC XBAR (see the file header):
- * the low alias (tt-kmd's addressing) and the Wormhole-style high
- * window (tt-umd blackhole_implementation.hpp:235).
- */
-static const UINT64 TtWindArcXbarBases[] = { 0x0ull, 0x800000000ull };
-#define TTWIND_ARC_XBAR_BASE_COUNT ARRAYSIZE(TtWindArcXbarBases)
-/* The ARC_STATUS report has exactly a low and a high boot-status slot. */
-C_ASSERT(ARRAYSIZE(TtWindArcXbarBases) == 2);
+/* NOC window bases for the two NOC routes to the APB block. */
+#define TTWIND_ARC_APB_NOC_LOW_BASE     0x80000000ull
+#define TTWIND_ARC_APB_NOC_HIGH_BASE    0x880000000ull
+
+/* Probe order: tt-kmd's route first, then the alternatives. */
+static const UINT32 TtWindArcRouteOrder[] = {
+    TTWIND_ARC_ROUTE_NOC_LOW,
+    TTWIND_ARC_ROUTE_NOC_HIGH,
+    TTWIND_ARC_ROUTE_AXI,
+};
+/* The ARC_STATUS report slots (low/high/axi) map to this order. */
+C_ASSERT(ARRAYSIZE(TtWindArcRouteOrder) == 3);
 
 /* Queue geometry (msgqueue.h). */
 #define TTWIND_ARC_QUEUE_HEADER_SIZE    32u
@@ -220,28 +251,74 @@ TtWindArcNocWrite32(
  * the kernel's NOC access somewhere unexpected.
  */
 /*
- * XBAR-relative accessors: XbarAddr is an address in the ARC XBAR's
- * 32-bit space (scratch/doorbell/CSM); the NOC address is formed by
- * adding the discovered window base. Callers hold ArcLock and run only
- * after (or as part of) discovery, so ArcNocBase is meaningful.
+ * APB accessors over an explicit route (probing) or the discovered one.
+ * ApbOffset is an offset within the ARC APB block (< 1 MiB). The AXI
+ * route requires the aperture mapping; callers pass ROUTE_AXI only
+ * when Ctx->ArcApbAxi is non-NULL. Callers hold ArcLock.
  */
 static UINT32
-TtWindArcXbarRead32(
+TtWindArcApbRead32Via(
     _In_ PTTWIND_DEVICE_CONTEXT Ctx,
-    _In_ UINT32 XbarAddr
+    _In_ UINT32 Route,
+    _In_ UINT32 ApbOffset
     )
 {
-    return TtWindArcNocRead32(Ctx, Ctx->ArcNocBase + XbarAddr);
+    NT_ASSERT(ApbOffset < TTWIND_BH_ARC_APB_BAR0_LEN);
+
+    switch (Route) {
+    case TTWIND_ARC_ROUTE_NOC_LOW:
+        return TtWindArcNocRead32(Ctx,
+                                  TTWIND_ARC_APB_NOC_LOW_BASE + ApbOffset);
+    case TTWIND_ARC_ROUTE_NOC_HIGH:
+        return TtWindArcNocRead32(Ctx,
+                                  TTWIND_ARC_APB_NOC_HIGH_BASE + ApbOffset);
+    case TTWIND_ARC_ROUTE_AXI:
+        NT_ASSERT(Ctx->ArcApbAxi != NULL);
+        return READ_REGISTER_ULONG(
+            (volatile ULONG *)(Ctx->ArcApbAxi + ApbOffset));
+    default:
+        NT_ASSERT(FALSE);
+        return 0xFFFFFFFFu;
+    }
 }
 
 static VOID
-TtWindArcXbarWrite32(
+TtWindArcApbWrite32Via(
     _In_ PTTWIND_DEVICE_CONTEXT Ctx,
-    _In_ UINT32 XbarAddr,
+    _In_ UINT32 Route,
+    _In_ UINT32 ApbOffset,
     _In_ UINT32 Value
     )
 {
-    TtWindArcNocWrite32(Ctx, Ctx->ArcNocBase + XbarAddr, Value);
+    NT_ASSERT(ApbOffset < TTWIND_BH_ARC_APB_BAR0_LEN);
+
+    switch (Route) {
+    case TTWIND_ARC_ROUTE_NOC_LOW:
+        TtWindArcNocWrite32(Ctx, TTWIND_ARC_APB_NOC_LOW_BASE + ApbOffset,
+                            Value);
+        break;
+    case TTWIND_ARC_ROUTE_NOC_HIGH:
+        TtWindArcNocWrite32(Ctx, TTWIND_ARC_APB_NOC_HIGH_BASE + ApbOffset,
+                            Value);
+        break;
+    case TTWIND_ARC_ROUTE_AXI:
+        NT_ASSERT(Ctx->ArcApbAxi != NULL);
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG *)(Ctx->ArcApbAxi + ApbOffset), Value);
+        break;
+    default:
+        NT_ASSERT(FALSE);
+        break;
+    }
+}
+
+static UINT32
+TtWindArcApbRead32(
+    _In_ PTTWIND_DEVICE_CONTEXT Ctx,
+    _In_ UINT32 ApbOffset
+    )
+{
+    return TtWindArcApbRead32Via(Ctx, Ctx->ArcRoute, ApbOffset);
 }
 
 static NTSTATUS
@@ -257,7 +334,8 @@ TtWindArcCsmRead32(
         (Addr & 3) != 0) {
         return STATUS_INVALID_ADDRESS;
     }
-    *Value = TtWindArcXbarRead32(Ctx, Addr);
+    /* CSM is always NOC at its plain address; see the file header. */
+    *Value = TtWindArcNocRead32(Ctx, Addr);
     return STATUS_SUCCESS;
 }
 
@@ -273,22 +351,25 @@ TtWindArcCsmWrite32(
         (Addr & 3) != 0) {
         return STATUS_INVALID_ADDRESS;
     }
-    TtWindArcXbarWrite32(Ctx, Addr, Value);
+    /* CSM is always NOC at its plain address; see the file header. */
+    TtWindArcNocWrite32(Ctx, Addr, Value);
     return STATUS_SUCCESS;
 }
 
 /*
  * Discover the firmware message queue. Mirrors
  * blackhole_arc_msg_locate_queue (blackhole.c:566-597) with one
- * addition: the ARC XBAR NOC window base is probed (see the file
- * header). Each candidate window's boot status is read each poll
- * round; the first window returning a live value with the ready bit
- * wins and is cached in Ctx->ArcNocBase for all subsequent traffic.
- * A cached base is re-verified for free, since the winning probe read
- * IS the boot-status check.
+ * addition: the route to the APB block is probed (see the file
+ * header). Each candidate route's boot status is read each poll round
+ * (one 32-bit read per route); the first route returning a live value
+ * with the ready bit wins and is cached in Ctx->ArcRoute for all
+ * subsequent APB traffic. A cached route is re-verified for free,
+ * since the winning probe read IS the boot-status check; the route is
+ * a fixed property of the silicon/firmware, so a fixed probe order is
+ * deterministic and the cache never flip-flops.
  *
  * Report, when non-NULL, receives the raw observations for the
- * ARC_STATUS diagnostic ioctl (boot status per window, QCB pointer,
+ * ARC_STATUS diagnostic ioctl (boot status per route, QCB pointer,
  * decoded queue); its Stage/LastStatus are filled by the caller.
  *
  * Waits are bounded (500 ms, tt-kmd's ARC_MSG_READY_MS). Caller holds
@@ -303,7 +384,7 @@ TtWindArcLocateQueue(
     )
 {
     UINT64 deadline = TtWindArcDeadline(TTWIND_ARC_READY_TIMEOUT_MS);
-    UINT32 bootStatus[TTWIND_ARC_XBAR_BASE_COUNT] = { 0 };
+    UINT32 bootStatus[ARRAYSIZE(TtWindArcRouteOrder)];
     BOOLEAN found = FALSE;
     BOOLEAN allDead;
     UINT32 qcbAddr;
@@ -315,33 +396,34 @@ TtWindArcLocateQueue(
     *QueueBase = 0;
     *NumEntries = 0;
 
+    /* Unprobed slots (e.g. no AXI aperture) report as all-1s. */
+    for (i = 0; i < ARRAYSIZE(TtWindArcRouteOrder); i++) {
+        bootStatus[i] = 0xFFFFFFFFu;
+    }
+
     for (;;) {
         allDead = TRUE;
 
-        /*
-         * Probe both windows each round (two 32-bit reads); which one
-         * answers is a fixed property of the silicon/firmware, so a
-         * fixed probe order is deterministic and the cache never
-         * flip-flops.
-         */
-        for (i = 0; i < TTWIND_ARC_XBAR_BASE_COUNT; i++) {
-            const UINT64 candidate = TtWindArcXbarBases[i];
+        for (i = 0; i < ARRAYSIZE(TtWindArcRouteOrder); i++) {
+            const UINT32 route = TtWindArcRouteOrder[i];
 
-            bootStatus[i] = TtWindArcNocRead32(
-                Ctx, candidate + TTWIND_ARC_BOOT_STATUS);
+            if (route == TTWIND_ARC_ROUTE_AXI && Ctx->ArcApbAxi == NULL) {
+                continue;
+            }
+
+            bootStatus[i] = TtWindArcApbRead32Via(Ctx, route,
+                                                  TTWIND_ARC_BOOT_STATUS);
 
             if (bootStatus[i] != 0xFFFFFFFFu) {
                 allDead = FALSE;
             }
             if (bootStatus[i] != 0xFFFFFFFFu &&
                 (bootStatus[i] & TTWIND_ARC_BOOT_STATUS_READY)) {
-                if (!Ctx->ArcNocBaseValid || Ctx->ArcNocBase != candidate) {
-                    KdPrint(("ttwind: ARC XBAR NOC window base "
-                             "0x%I64X (boot status 0x%08X)\n",
-                             candidate, bootStatus[i]));
+                if (Ctx->ArcRoute != route) {
+                    KdPrint(("ttwind: ARC APB route %u (boot status "
+                             "0x%08X)\n", route, bootStatus[i]));
                 }
-                Ctx->ArcNocBase = candidate;
-                Ctx->ArcNocBaseValid = TRUE;
+                Ctx->ArcRoute = route;
                 found = TRUE;
                 break;
             }
@@ -350,29 +432,30 @@ TtWindArcLocateQueue(
         if (Report != NULL) {
             Report->BootStatusLow = bootStatus[0];
             Report->BootStatusHigh = bootStatus[1];
+            Report->BootStatusAxi = bootStatus[2];
         }
 
         if (found) {
             break;
         }
         if (allDead) {
-            /* Every window reads all-1s: NOC hung or device gone. */
+            /* Every route reads all-1s: NOC hung or device gone. */
             return STATUS_DEVICE_DOES_NOT_EXIST;
         }
         if (TtWindArcPastDeadline(deadline)) {
             KdPrint(("ttwind: ARC not ready for messages (boot status "
-                     "low 0x%08X high 0x%08X)\n",
-                     bootStatus[0], bootStatus[1]));
+                     "low 0x%08X high 0x%08X axi 0x%08X)\n",
+                     bootStatus[0], bootStatus[1], bootStatus[2]));
             return STATUS_DEVICE_NOT_READY;
         }
         TtWindArcStall(200);
     }
 
     if (Report != NULL) {
-        Report->NocBase = Ctx->ArcNocBase;
+        Report->Route = Ctx->ArcRoute;
     }
 
-    qcbAddr = TtWindArcXbarRead32(Ctx, TTWIND_ARC_MSG_QCB_PTR);
+    qcbAddr = TtWindArcApbRead32(Ctx, TTWIND_ARC_MSG_QCB_PTR);
     if (Report != NULL) {
         Report->QcbPtr = qcbAddr;
     }
@@ -587,8 +670,16 @@ TtWindArcMsgSendSync(
         goto out;
     }
 
-    /* Ring the doorbell: the firmware's queue processor runs on this. */
-    TtWindArcXbarWrite32(ctx, TTWIND_ARC_MSI_FIFO, 0);
+    /*
+     * Ring the doorbell: the firmware's queue processor runs on this.
+     * Mechanism per route - see the doorbell comment at the top.
+     */
+    if (ctx->ArcRoute == TTWIND_ARC_ROUTE_AXI) {
+        TtWindArcApbWrite32Via(ctx, ctx->ArcRoute, TTWIND_ARC_MISC_CNTL,
+                               TTWIND_ARC_MISC_CNTL_IRQ0);
+    } else {
+        TtWindArcApbWrite32Via(ctx, ctx->ArcRoute, TTWIND_ARC_MSI_FIFO, 0);
+    }
 
     deadline = TtWindArcDeadline(TTWIND_ARC_MSG_TIMEOUT_MS);
     for (;;) {
@@ -831,7 +922,7 @@ TtWindIoctlArcStatus(
     }
 
     RtlZeroMemory(&report, sizeof(report));
-    report.NocBase = ~0ull;
+    report.Route = TTWIND_ARC_ROUTE_NONE;
 
     WdfWaitLockAcquire(ctx->ArcLock, NULL);
 
@@ -844,8 +935,8 @@ TtWindIoctlArcStatus(
         report.LastStatus = (unsigned int)status;
         if (NT_SUCCESS(status)) {
             report.Stage = TTWIND_ARC_STAGE_QUEUE_OK;
-        } else if (report.NocBase != ~0ull) {
-            /* A window answered ready, but the queue didn't check out. */
+        } else if (report.Route != TTWIND_ARC_ROUTE_NONE) {
+            /* A route answered ready, but the queue didn't check out. */
             report.Stage = TTWIND_ARC_STAGE_BAD_QUEUE;
         } else {
             report.Stage = TTWIND_ARC_STAGE_NO_BOOT_READY;

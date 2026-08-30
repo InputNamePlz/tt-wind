@@ -265,6 +265,26 @@ TtWindEvtDevicePrepareHardware(
         }
     }
 
+    /*
+     * Map the ARC APB AXI aperture (BAR0 + 0x1FF00000, 1 MiB) - one of
+     * the candidate routes to the ARC scratch registers (arc.c).
+     * Best-effort: without it the NOC routes are still probed.
+     */
+    if (ctx->Bars[0].Size >=
+        (UINT64)TTWIND_BH_ARC_APB_BAR0_START + TTWIND_BH_ARC_APB_BAR0_LEN) {
+        PHYSICAL_ADDRESS apbPhys;
+
+        apbPhys.QuadPart = ctx->Bars[0].Phys.QuadPart +
+                           TTWIND_BH_ARC_APB_BAR0_START;
+        ctx->ArcApbAxi = (PUCHAR)MmMapIoSpaceEx(apbPhys,
+                                                TTWIND_BH_ARC_APB_BAR0_LEN,
+                                                PAGE_READWRITE | PAGE_NOCACHE);
+        if (ctx->ArcApbAxi == NULL) {
+            KdPrint(("ttwind: MmMapIoSpaceEx(ARC APB aperture) failed; "
+                     "continuing with NOC routes only\n"));
+        }
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -302,6 +322,11 @@ TtWindEvtDeviceReleaseHardware(
         MmUnmapIoSpace(ctx->KernelTlb, TTWIND_BH_TLB_2M_SIZE);
         ctx->KernelTlb = NULL;
     }
+    if (ctx->ArcApbAxi != NULL) {
+        MmUnmapIoSpace(ctx->ArcApbAxi, TTWIND_BH_ARC_APB_BAR0_LEN);
+        ctx->ArcApbAxi = NULL;
+    }
+    ctx->ArcRoute = TTWIND_ARC_ROUTE_NONE;
     WdfWaitLockRelease(ctx->ArcLock);
 
     /*

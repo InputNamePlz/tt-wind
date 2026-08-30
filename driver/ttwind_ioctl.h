@@ -286,38 +286,51 @@ typedef struct _TTWIND_RESET_DEVICE_IN {
  * reads of the ARC tile only); always completes with STATUS_SUCCESS
  * when the device is started - the outcome is in the payload.
  *
- * The ARC XBAR (scratch registers, CSM, doorbell) is probed through two
- * candidate NOC windows on tile (8,0): the low alias used by tt-kmd
- * (NOC address == XBAR address, e.g. boot status at 0x80030408) and the
- * high window at 0x8_00000000 + XBAR address (Wormhole-style; declared
- * for Blackhole as ARC_NOC_TO_ARC_XBAR_MAP_ADDRESS_START in tt-umd).
+ * The ARC APB block (reset-unit scratch registers and the doorbell) is
+ * probed through three candidate routes on tile (8,0):
+ *   1. NOC, low alias: NOC address = 0x80000000 + APB offset (what
+ *      tt-kmd uses; boot status at 0x80030408),
+ *   2. NOC, high window: NOC address = 0x8_80000000 + APB offset
+ *      (Wormhole's ARC-over-NOC addressing),
+ *   3. BAR0 AXI aperture: BAR0 offset 0x1FF00000 + APB offset (what
+ *      tt-umd's read_from_arc_apb uses over PCIe when available).
+ * The CSM (message ring memory) is always accessed via the NOC low
+ * alias (NOC address = CSM address, 0x100xxxxx), which is what tt-kmd
+ * does and is verified to decode on this hardware.
  *
  * @Stage: TTWIND_ARC_STAGE_*.
  * @LastStatus: NTSTATUS of the probe (0 on full success).
- * @BootStatusLow / @BootStatusHigh: raw single reads of SCRATCH_RAM_2
- *      (boot status) through the low alias / high window.
- * @NocBase: the ARC XBAR NOC window base the driver selected
- *      (0 or 0x800000000); ~0 if discovery never succeeded.
+ * @BootStatusLow / @BootStatusHigh / @BootStatusAxi: raw single reads
+ *      of SCRATCH_RAM_2 (boot status) through routes 1 / 2 / 3.
+ *      BootStatusAxi is 0xFFFFFFFF when the aperture is unmapped
+ *      (BAR0 too small).
+ * @Route: TTWIND_ARC_ROUTE_* the driver selected for APB access.
  * @QcbPtr: raw SCRATCH_RAM_11 (queue control block pointer) read
- *      through the selected window; 0 if none selected.
+ *      through the selected route; 0 if none selected.
  * @QueueBase / @NumEntries: decoded firmware queue, when Stage is
  *      TTWIND_ARC_STAGE_QUEUE_OK.
  */
 #define TTWIND_ARC_STAGE_NOT_STARTED   0u /* device/hw not ready       */
-#define TTWIND_ARC_STAGE_NO_BOOT_READY 1u /* no window showed ready    */
+#define TTWIND_ARC_STAGE_NO_BOOT_READY 1u /* no route showed ready     */
 #define TTWIND_ARC_STAGE_BAD_QUEUE     2u /* ready, but QCB/queue bad  */
 #define TTWIND_ARC_STAGE_QUEUE_OK      3u /* queue located             */
 
+#define TTWIND_ARC_ROUTE_NONE     0u
+#define TTWIND_ARC_ROUTE_NOC_LOW  1u /* NOC 0x80000000 + APB offset    */
+#define TTWIND_ARC_ROUTE_NOC_HIGH 2u /* NOC 0x8_80000000 + APB offset  */
+#define TTWIND_ARC_ROUTE_AXI      3u /* BAR0 0x1FF00000 + APB offset   */
+
 typedef struct _TTWIND_ARC_STATUS_OUT {
-    unsigned int     Stage;
-    unsigned int     LastStatus;     /* NTSTATUS of the probe          */
-    unsigned int     BootStatusLow;  /* SCRATCH_RAM_2 via low alias    */
-    unsigned int     BootStatusHigh; /* SCRATCH_RAM_2 via high window  */
-    unsigned __int64 NocBase;        /* selected window; ~0 if none    */
-    unsigned int     QcbPtr;         /* SCRATCH_RAM_11 via selection   */
-    unsigned int     QueueBase;
-    unsigned int     NumEntries;
-    unsigned int     Reserved;       /* zero */
+    unsigned int Stage;
+    unsigned int LastStatus;     /* NTSTATUS of the probe              */
+    unsigned int BootStatusLow;  /* SCRATCH_RAM_2 via NOC low alias    */
+    unsigned int BootStatusHigh; /* SCRATCH_RAM_2 via NOC high window  */
+    unsigned int BootStatusAxi;  /* SCRATCH_RAM_2 via BAR0 aperture    */
+    unsigned int Route;          /* TTWIND_ARC_ROUTE_* selected        */
+    unsigned int QcbPtr;         /* SCRATCH_RAM_11 via selection       */
+    unsigned int QueueBase;
+    unsigned int NumEntries;
+    unsigned int Reserved;       /* zero */
 } TTWIND_ARC_STATUS_OUT;
 
 #ifdef __cplusplus

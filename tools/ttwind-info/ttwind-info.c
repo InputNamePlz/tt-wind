@@ -18,8 +18,9 @@
  *   arcmsg <hdr> [w1..w7]  Send a raw 8x u32 ARC (SMC) firmware message
  *                          (missing words are 0), print the response.
  *   arcstatus              Run one ARC discovery probe and print the raw
- *                          observations (boot status via both candidate
- *                          NOC windows, QCB pointer, queue geometry).
+ *                          observations (boot status via all candidate
+ *                          routes, selected route, QCB pointer, queue
+ *                          geometry).
  *   reset                  IOCTL_TTWIND_RESET_DEVICE (refused while any
  *                          user mapping exists).
  * Numeric arguments accept 0x-prefixed hex.
@@ -426,9 +427,15 @@ static int cmd_arcstatus(void)
 {
     static const char *const stage_names[] = {
         "0 (device not started)",
-        "1 (no window showed boot-ready)",
+        "1 (no route showed boot-ready)",
         "2 (ready, but queue control block/queue invalid)",
         "3 (message queue located)",
+    };
+    static const char *const route_names[] = {
+        "none",
+        "NOC low alias (0x80000000 + APB offset)",
+        "NOC high window (0x8_80000000 + APB offset)",
+        "BAR0 AXI aperture (0x1FF00000 + APB offset)",
     };
     TTWIND_ARC_STATUS_OUT st;
     DWORD returned = 0;
@@ -452,13 +459,11 @@ static int cmd_arcstatus(void)
     printf("Stage           : %s\n",
            st.Stage < 4 ? stage_names[st.Stage] : "?");
     printf("Probe NTSTATUS  : 0x%08x\n", st.LastStatus);
-    printf("Boot status     : low-alias(base 0x0)=0x%08x  "
-           "high-window(base 0x800000000)=0x%08x\n",
-           st.BootStatusLow, st.BootStatusHigh);
-    if (st.NocBase == ~0ull)
-        printf("Selected window : none\n");
-    else
-        printf("Selected window : NOC base 0x%llx\n", st.NocBase);
+    printf("Boot status     : noc-low=0x%08x  noc-high=0x%08x  "
+           "axi=0x%08x\n",
+           st.BootStatusLow, st.BootStatusHigh, st.BootStatusAxi);
+    printf("Selected route  : %s\n",
+           st.Route < 4 ? route_names[st.Route] : "?");
     printf("QCB pointer     : 0x%08x\n", st.QcbPtr);
     printf("Queue           : base 0x%08x, %u entries\n",
            st.QueueBase, st.NumEntries);

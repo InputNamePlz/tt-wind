@@ -43,6 +43,18 @@
     ((UINT64)TTWIND_BH_KERNEL_TLB_INDEX * TTWIND_BH_TLB_2M_SIZE)
 
 /*
+ * Fixed AXI aperture in BAR0 that exposes the ARC APB block (reset-unit
+ * scratch registers, doorbell) without going over the NOC. From tt-umd:
+ * ARC_APB_BAR0_XBAR_OFFSET_START = 0x1FF00000
+ * (blackhole_implementation.hpp:219), used as
+ * bar_read32(0x1FF00000 + APB offset) by BlackholeTTDevice::
+ * read_from_arc_apb (blackhole_tt_device.cpp:265-270). One megabyte
+ * covers every APB offset tt-umd accesses this way.
+ */
+#define TTWIND_BH_ARC_APB_BAR0_START 0x1FF00000u
+#define TTWIND_BH_ARC_APB_BAR0_LEN   0x00100000u
+
+/*
  * One ARC (SMC) firmware mailbox message: 8 32-bit words, word 0 is the
  * header (message type in the low byte). Same layout as tt-kmd's
  * struct arc_msg (msgqueue.h).
@@ -127,13 +139,20 @@ typedef struct _TTWIND_DEVICE_CONTEXT {
     WDFWAITLOCK ArcLock;
 
     /*
-     * NOC window base through which the ARC XBAR (scratch, CSM,
-     * doorbell) answers on this card: 0 (tt-kmd's low alias) or
-     * 0x800000000 (the Wormhole-style high window). Discovered by
-     * probing at queue-location time; guarded by ArcLock.
+     * Kernel UC mapping of the ARC APB AXI aperture in BAR0
+     * (TTWIND_BH_ARC_APB_BAR0_START). NULL when BAR0 is too small.
+     * Mapped at PrepareHardware, unmapped at ReleaseHardware; used
+     * under ArcLock only.
      */
-    UINT64  ArcNocBase;
-    BOOLEAN ArcNocBaseValid;
+    PUCHAR ArcApbAxi;
+
+    /*
+     * Route through which the ARC APB block (scratch registers,
+     * doorbell) answers on this card: a TTWIND_ARC_ROUTE_* value,
+     * TTWIND_ARC_ROUTE_NONE until discovery has succeeded once.
+     * Discovered by probing at queue-location time; guarded by ArcLock.
+     */
+    UINT32 ArcRoute;
 
     /*
      * Config-space access to this function via the parent bus driver.
