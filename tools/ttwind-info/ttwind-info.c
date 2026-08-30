@@ -357,6 +357,165 @@ out_close:
 }
 
 /*
+ * tlbreadx: like tlbread, but every CONFIGURE_TLB field is settable via
+ * key=value arguments so window configurations can be A/B tested from
+ * user mode without touching the driver. Defaults reproduce tlbread's
+ * configuration (NOC0 unicast, strict ordering, UC mapping).
+ *
+ *   ttwind-info tlbreadx addr=<addr> xend=<x> yend=<y> [xstart=] [ystart=]
+ *               [noc=] [mcast=] [ordering=] [linked=] [staticvc=] [wc=0|1]
+ */
+static int cmd_tlbreadx(int argc, char **argv)
+{
+    static const unsigned __int64 win_mask = TTWIND_TLB_WINDOW_SIZE_2M - 1;
+    TTWIND_ALLOCATE_TLB_IN alloc_in;
+    TTWIND_ALLOCATE_TLB_OUT alloc_out;
+    TTWIND_CONFIGURE_TLB_IN cfg_in;
+    TTWIND_MAP_TLB_IN map_in;
+    TTWIND_MAP_TLB_OUT map_out;
+    TTWIND_UNMAP_BAR_IN unmap_in;
+    TTWIND_FREE_TLB_IN free_in;
+    unsigned __int64 addr = 0, xend = 0, yend = 0, xstart = 0, ystart = 0;
+    unsigned __int64 noc = 0, mcast = 0, ordering = 1, linked = 0;
+    unsigned __int64 staticvc = 0, wc = 0;
+    int have_addr = 0;
+    volatile unsigned int *reg;
+    unsigned int value;
+    DWORD returned = 0;
+    HANDLE h;
+    int i;
+    int rc = 2;
+
+    for (i = 0; i < argc; i++) {
+        const char *eq = strchr(argv[i], '=');
+        unsigned __int64 *dst = NULL;
+
+        if (eq == NULL) {
+            fprintf(stderr, "expected key=value, got '%s'\n", argv[i]);
+            return 2;
+        }
+        if (strncmp(argv[i], "addr=", 5) == 0) {
+            dst = &addr;
+            have_addr = 1;
+        } else if (strncmp(argv[i], "xend=", 5) == 0) {
+            dst = &xend;
+        } else if (strncmp(argv[i], "yend=", 5) == 0) {
+            dst = &yend;
+        } else if (strncmp(argv[i], "xstart=", 7) == 0) {
+            dst = &xstart;
+        } else if (strncmp(argv[i], "ystart=", 7) == 0) {
+            dst = &ystart;
+        } else if (strncmp(argv[i], "noc=", 4) == 0) {
+            dst = &noc;
+        } else if (strncmp(argv[i], "mcast=", 6) == 0) {
+            dst = &mcast;
+        } else if (strncmp(argv[i], "ordering=", 9) == 0) {
+            dst = &ordering;
+        } else if (strncmp(argv[i], "linked=", 7) == 0) {
+            dst = &linked;
+        } else if (strncmp(argv[i], "staticvc=", 9) == 0) {
+            dst = &staticvc;
+        } else if (strncmp(argv[i], "wc=", 3) == 0) {
+            dst = &wc;
+        } else {
+            fprintf(stderr, "unknown key in '%s'\n", argv[i]);
+            return 2;
+        }
+        if (parse_u64(eq + 1, dst))
+            return 2;
+    }
+
+    if (!have_addr) {
+        fprintf(stderr, "tlbreadx: addr= is required\n");
+        return 2;
+    }
+    if (addr % 4 != 0) {
+        fprintf(stderr, "addr must be 4-byte aligned\n");
+        return 2;
+    }
+    if (xend > 0x3F || yend > 0x3F || xstart > 0x3F || ystart > 0x3F ||
+        noc > 1 || mcast > 1 || ordering > 3 || linked > 1 ||
+        staticvc > 1 || wc > 1) {
+        fprintf(stderr, "field out of range\n");
+        return 2;
+    }
+
+    h = open_first_device();
+    if (h == INVALID_HANDLE_VALUE)
+        return 2;
+
+    memset(&alloc_in, 0, sizeof(alloc_in));
+    alloc_in.Size = TTWIND_TLB_WINDOW_SIZE_2M;
+    if (!DeviceIoControl(h, IOCTL_TTWIND_ALLOCATE_TLB, &alloc_in,
+                         sizeof(alloc_in), &alloc_out, sizeof(alloc_out),
+                         &returned, NULL)) {
+        print_win32_error("ALLOCATE_TLB failed", GetLastError());
+        goto out_close;
+    }
+
+    memset(&cfg_in, 0, sizeof(cfg_in));
+    cfg_in.TlbId = alloc_out.TlbId;
+    cfg_in.Config.Addr = addr & ~win_mask;
+    cfg_in.Config.XEnd = (unsigned short)xend;
+    cfg_in.Config.YEnd = (unsigned short)yend;
+    cfg_in.Config.XStart = (unsigned short)xstart;
+    cfg_in.Config.YStart = (unsigned short)ystart;
+    cfg_in.Config.Noc = (unsigned char)noc;
+    cfg_in.Config.Mcast = (unsigned char)mcast;
+    cfg_in.Config.Ordering = (unsigned char)ordering;
+    cfg_in.Config.Linked = (unsigned char)linked;
+    cfg_in.Config.StaticVc = (unsigned char)staticvc;
+
+    printf("TLB %u <- addr=0x%llx end=(%llu,%llu) start=(%llu,%llu) "
+           "noc=%llu mcast=%llu ordering=%llu linked=%llu staticvc=%llu "
+           "cache=%s\n",
+           alloc_out.TlbId, cfg_in.Config.Addr, xend, yend, xstart, ystart,
+           noc, mcast, ordering, linked, staticvc, wc ? "WC" : "UC");
+
+    if (!DeviceIoControl(h, IOCTL_TTWIND_CONFIGURE_TLB, &cfg_in,
+                         sizeof(cfg_in), NULL, 0, &returned, NULL)) {
+        print_win32_error("CONFIGURE_TLB failed", GetLastError());
+        goto out_free;
+    }
+
+    memset(&map_in, 0, sizeof(map_in));
+    map_in.TlbId = alloc_out.TlbId;
+    map_in.CacheMode = wc ? TTWIND_CACHE_WC : TTWIND_CACHE_UC;
+    if (!DeviceIoControl(h, IOCTL_TTWIND_MAP_TLB, &map_in, sizeof(map_in),
+                         &map_out, sizeof(map_out), &returned, NULL)) {
+        print_win32_error("MAP_TLB failed", GetLastError());
+        goto out_free;
+    }
+
+    reg = (volatile unsigned int *)(ULONG_PTR)
+          (map_out.UserVa + (addr & win_mask));
+    value = *reg;
+    printf("NOC%llu (%llu, %llu) [0x%llx] = 0x%08x\n",
+           noc, xend, yend, addr, value);
+    rc = 0;
+
+    memset(&unmap_in, 0, sizeof(unmap_in));
+    unmap_in.UserVa = map_out.UserVa;
+    if (!DeviceIoControl(h, IOCTL_TTWIND_UNMAP_BAR, &unmap_in,
+                         sizeof(unmap_in), NULL, 0, &returned, NULL)) {
+        print_win32_error("UNMAP_BAR failed", GetLastError());
+        rc = 2;
+    }
+
+out_free:
+    memset(&free_in, 0, sizeof(free_in));
+    free_in.TlbId = alloc_out.TlbId;
+    if (!DeviceIoControl(h, IOCTL_TTWIND_FREE_TLB, &free_in,
+                         sizeof(free_in), NULL, 0, &returned, NULL)) {
+        print_win32_error("FREE_TLB failed", GetLastError());
+        rc = 2;
+    }
+out_close:
+    CloseHandle(h);
+    return rc;
+}
+
+/*
  * arcmsg <hdr> [w1..w7]: one synchronous ARC (SMC) firmware message.
  * Word 0 is the header (message type in the low byte); unspecified
  * words are zero. Prints the raw 8-word response; the firmware status
@@ -511,6 +670,9 @@ static int usage(void)
             "usage: ttwind-info                       list devices\n"
             "       ttwind-info bar0read <offset>     read u32 from BAR0\n"
             "       ttwind-info tlbread <x> <y> <addr> read u32 via TLB window\n"
+            "       ttwind-info tlbreadx addr=<a> xend=<x> yend=<y> [xstart=] [ystart=]\n"
+            "                   [noc=] [mcast=] [ordering=] [linked=] [staticvc=] [wc=]\n"
+            "                                         read u32, every TLB field settable\n"
             "       ttwind-info arcmsg <hdr> [w1..w7] send raw ARC/SMC message\n"
             "       ttwind-info arcstatus             probe ARC queue discovery\n"
             "       ttwind-info reset                 reset the device\n");
@@ -528,6 +690,8 @@ int main(int argc, char **argv)
             return cmd_bar0read(argv[2]);
         if (strcmp(argv[1], "tlbread") == 0 && argc == 5)
             return cmd_tlbread(argv[2], argv[3], argv[4]);
+        if (strcmp(argv[1], "tlbreadx") == 0 && argc >= 3)
+            return cmd_tlbreadx(argc - 2, argv + 2);
         if (strcmp(argv[1], "arcmsg") == 0 && argc >= 3 && argc <= 10)
             return cmd_arcmsg(argc - 2, argv + 2);
         if (strcmp(argv[1], "arcstatus") == 0 && argc == 2)

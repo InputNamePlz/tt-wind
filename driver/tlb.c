@@ -39,8 +39,17 @@
 
 /*
  * OR `Value` (masked to Width bits) into a 96-bit register image held
- * as Lo (bits 0..63) and Hi (bits 64..95). Pos < 64; fields may
- * straddle the 64-bit boundary.
+ * as Lo (bits 0..63) and Hi (bits 64..95). Pos may be anywhere in
+ * 0..95; fields may straddle the 64-bit boundary.
+ *
+ * Pos >= 64 must be handled explicitly: `masked << Pos` with Pos >= 64
+ * is undefined behavior, and x64 executes it as a shift by (Pos % 64),
+ * which would OR the value into the ADDRESS bits of Lo instead of Hi.
+ * That exact bug shipped in 100.3.2.0: every field above bit 63 (noc,
+ * mcast, ordering, linked, use_static_vc) leaked into address bits
+ * Pos-64, so e.g. ordering=1 (bit 70) flipped NOC-address bit 27 and
+ * pointed the window at addr+0x0800_0000 while the real ordering bits
+ * stayed 0.
  */
 static VOID
 TtWindPutField(
@@ -53,11 +62,15 @@ TtWindPutField(
 {
     UINT64 masked = Value & ((Width >= 64) ? ~0ull : ((1ull << Width) - 1));
 
-    NT_ASSERT(Pos < 64 && Pos + Width <= 96);
+    NT_ASSERT(Pos < 96 && Pos + Width <= 96);
 
-    *Lo |= masked << Pos;
-    if (Pos + Width > 64) {
-        *Hi |= (UINT32)(masked >> (64 - Pos));
+    if (Pos < 64) {
+        *Lo |= masked << Pos;
+        if (Pos + Width > 64) {
+            *Hi |= (UINT32)(masked >> (64 - Pos));
+        }
+    } else {
+        *Hi |= (UINT32)(masked << (Pos - 64));
     }
 }
 
