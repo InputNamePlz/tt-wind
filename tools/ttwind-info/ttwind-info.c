@@ -666,8 +666,15 @@ static int cmd_reset(void)
         goto out_close;
     }
 
+    /* Grace period before the first poll: the DBI timer takes a moment
+     * to fire, and an immediate poll would just see the reset marker
+     * still set ("pending"). tt-kmd's userspace sleeps ~2 s here
+     * (warm_reset.cpp); 1 s has been ample for one Blackhole. */
     memset(&post_in, 0, sizeof(post_in));
     printf("Waiting for the device to return (polling POST_RESET)...\n");
+    Sleep(1000);
+
+    err = 0;
     for (waited = 0; ; waited += 100) {
         if (DeviceIoControl(h, IOCTL_TTWIND_POST_RESET, &post_in,
                             sizeof(post_in), NULL, 0, &returned, NULL)) {
@@ -676,16 +683,23 @@ static int cmd_reset(void)
             break;
         }
         err = GetLastError();
-        if (err == ERROR_GEN_FAILURE) {
-            /* STATUS_UNSUCCESSFUL: the chip ignored the reset trigger;
-             * the device was never disturbed. Retrying would report a
-             * hollow success, so stop here. */
-            fprintf(stderr, "device ignored the reset trigger\n");
-            rc = 1;
-            break;
-        }
+        /* ERROR_BUSY = reset pending (marker not cleared yet) and
+         * ERROR_BAD_UNIT = device not back on the bus yet: both are
+         * keep-polling statuses. Other errors are retried too - a
+         * restore/MMIO-gate failure is retryable by contract. */
         if (waited >= 15000) {
-            print_win32_error("POST_RESET failed", err);
+            if (err == ERROR_BUSY) {
+                /* Every poll in the whole budget saw the marker still
+                 * set: the chip ignored the trigger. This terminal
+                 * diagnosis is deliberately made HERE, not in the
+                 * driver - one early sample cannot tell "timer has not
+                 * fired yet" from "never will" (the v100.3.4 bug). */
+                fprintf(stderr, "device ignored the reset trigger "
+                        "(marker never cleared in %lu ms)\n", waited);
+                rc = 1;
+            } else {
+                print_win32_error("POST_RESET failed", err);
+            }
             break;
         }
         Sleep(100);

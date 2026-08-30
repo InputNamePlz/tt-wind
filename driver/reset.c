@@ -387,9 +387,11 @@ out:
  *
  *   PROBE      config vendor ID; not back -> DOES_NOT_EXIST (retry)
  *      |
- *   MARKER     COMMAND parity bit still set -> the chip ignored the
- *      |       trigger; device undisturbed: clear marker, leave the
- *      |       restricted state, STATUS_UNSUCCESSFUL
+ *   MARKER     COMMAND parity bit still set -> the DBI timer has not
+ *      |       fired yet (or never will): stay restricted, return
+ *      |       DEVICE_BUSY ("reset pending" - retry). The caller owns
+ *      |       the "ignored the trigger" diagnosis, made only after
+ *      |       its whole budget expires with the marker still set.
  *      |
  *   RESTORE    full config restore (BARs, MSI, PCIe DevCtl incl.
  *      |       MaxPayload/MaxReadRequest - the MaxReadRequest re-init
@@ -460,10 +462,20 @@ TtWindIoctlPostReset(
 
     /*
      * MARKER: untouched since the arm (nothing writes COMMAND between
-     * RESET_DEVICE's marker write and this read). Still set => the
-     * trigger was ignored and the device never reset: restore the
-     * pre-marker COMMAND value and leave the restricted state - the
-     * device is exactly as it was before the arm.
+     * RESET_DEVICE's marker write and this read). Still set means the
+     * DBI timer has not fired YET - or the chip is ignoring the
+     * trigger; the two are indistinguishable from one sample, so stay
+     * restricted and report "reset pending" (retryable). The terminal
+     * "ignored the trigger" diagnosis belongs to the CALLER, after its
+     * whole polling budget expires with the marker never clearing.
+     *
+     * v100.3.4 got this wrong: it treated the first marker-still-set
+     * poll (~100 ms after arm) as terminal, un-restricted the device,
+     * and the timer then fired moments later - leaving a freshly reset
+     * chip unrestored and unguarded. tt-kmd's userspace sleeps ~2 s
+     * before even starting to poll (warm_reset.cpp); our grace period
+     * lives in the caller too, but the driver must stay safe against
+     * any polling cadence.
      */
     if (!TtWindCfgRead(ctx, TTWIND_PCI_CFG_COMMAND, &command,
                        sizeof(command))) {
@@ -471,14 +483,7 @@ TtWindIoctlPostReset(
         goto out;
     }
     if (command & TTWIND_PCI_CMD_PARITY) {
-        UINT16 saved =
-            (UINT16)(ctx->SavedConfig[TTWIND_PCI_CFG_COMMAND / 4] & 0xFFFF);
-
-        KdPrint(("ttwind: reset marker still set; reset did not occur\n"));
-        (VOID)TtWindCfgWrite(ctx, TTWIND_PCI_CFG_COMMAND, &saved,
-                             sizeof(saved));
-        ctx->NeedsHwInit = FALSE;
-        status = STATUS_UNSUCCESSFUL;
+        status = STATUS_DEVICE_BUSY; /* reset pending; keep polling */
         goto out;
     }
 

@@ -305,10 +305,12 @@ typedef struct _TTWIND_RESET_DEVICE_IN {
 /*
  * Input of IOCTL_TTWIND_POST_RESET. No output buffer.
  *
- * Completes a reset armed by RESET_DEVICE. Cheap and retryable: call
- * it repeatedly (e.g. every 100 ms for up to ~10 s) after RESET_DEVICE
- * until it stops returning STATUS_DEVICE_DOES_NOT_EXIST. It performs,
- * in order: config-space probe for the device's return (vendor ID) ->
+ * Completes a reset armed by RESET_DEVICE. Cheap and retryable: give
+ * the DBI timer a ~1-2 s grace period after RESET_DEVICE (tt-kmd's
+ * userspace sleeps ~2 s before polling, warm_reset.cpp), then call
+ * this repeatedly (e.g. every 100 ms, total budget ~15 s) until it
+ * stops returning a retryable status. It performs, in order:
+ * config-space probe for the device's return (vendor ID) ->
  * reset-marker check -> full config-space restore (BARs, MSI, PCIe
  * DevCtl incl. MaxPayload/MaxReadRequest; COMMAND register last) ->
  * re-save of the restored config -> ONE bounded MMIO sanity readback
@@ -320,16 +322,23 @@ typedef struct _TTWIND_RESET_DEVICE_IN {
  *  - STATUS_SUCCESS: recovered (or nothing was pending).
  *  - STATUS_DEVICE_DOES_NOT_EXIST: device not back on the bus yet;
  *    still restricted - keep polling.
- *  - STATUS_UNSUCCESSFUL: the chip ignored the reset trigger (marker
- *    still set). The device was never disturbed; the restricted state
- *    is exited and the marker cleared.
+ *  - STATUS_DEVICE_BUSY: reset pending - the device answers config
+ *    cycles but the reset marker is still set, i.e. the DBI timer has
+ *    not fired yet; still restricted - keep polling. If the FULL
+ *    polling budget expires with every poll returning this, the chip
+ *    ignored the trigger - that terminal diagnosis is the caller's,
+ *    never the driver's (a single early sample cannot tell "not yet"
+ *    from "never", and v100.3.4's in-driver verdict un-restricted the
+ *    device just before a late-firing reset). Recover by re-arming
+ *    RESET_DEVICE (allowed while restricted) or PnP disable/enable.
  *  - STATUS_DEVICE_DATA_ERROR: config restore failed/incomplete;
  *    still restricted - retry.
  *  - STATUS_IO_DEVICE_ERROR: the device answers config cycles but the
  *    MMIO sanity readback failed; still restricted - retry, or re-arm
  *    RESET_DEVICE.
  * The restricted state is never permanent: POST_RESET can always be
- * retried, and only PnP removal makes the device dead.
+ * retried, RESET_DEVICE can always re-arm, and only PnP removal makes
+ * the device dead.
  *
  * Flags and Reserved must be 0.
  */
