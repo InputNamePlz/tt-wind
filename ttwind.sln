@@ -4,6 +4,8 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ttwind", "driver\ttwind.vcxproj", "{7A2F14D1-9C63-4E14-8B1A-1F26945F8D80}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ttwind-info", "tools\ttwind-info\ttwind-info.vcxproj", "{3C0B54E7-2A11-4F6D-9E80-7C60EB3C630F}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -14,6 +16,10 @@ Global
 		{7A2F14D1-9C63-4E14-8B1A-1F26945F8D80}.Debug|x64.Build.0 = Debug|x64
 		{7A2F14D1-9C63-4E14-8B1A-1F26945F8D80}.Release|x64.ActiveCfg = Release|x64
 		{7A2F14D1-9C63-4E14-8B1A-1F26945F8D80}.Release|x64.Build.0 = Release|x64
+		{3C0B54E7-2A11-4F6D-9E80-7C60EB3C630F}.Debug|x64.ActiveCfg = Debug|x64
+		{3C0B54E7-2A11-4F6D-9E80-7C60EB3C630F}.Debug|x64.Build.0 = Debug|x64
+		{3C0B54E7-2A11-4F6D-9E80-7C60EB3C630F}.Release|x64.ActiveCfg = Release|x64
+		{3C0B54E7-2A11-4F6D-9E80-7C60EB3C630F}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
