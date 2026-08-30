@@ -716,13 +716,76 @@ out_close:
     return rc;
 }
 
+/* Print one IOCTL_TTWIND_SYSMEM_STATUS report. */
+static void print_sysmem_status(const TTWIND_SYSMEM_STATUS_OUT *st)
+{
+    static const char *const stage_names[] = {
+        "0 (arm never attempted)",
+        "1 (allocation failed - no buffer at any tier)",
+        "2 (BAR2 iATU / NOC_ID / kernel TLB mapping missing)",
+        "3 (PCIe tile detection failed)",
+        "4 (iATU programming failed)",
+        "5 (loopback verification failed)",
+        "6 (verified - sysmem armed)",
+    };
+    static const char *const tier_names[] = {
+        "not tried", "FAILED", "ok",
+    };
+    char sizebuf[64];
+    unsigned i;
+
+    printf("Arm stage       : %s\n",
+           st->Stage < 7 ? stage_names[st->Stage] : "?");
+    printf("Arm NTSTATUS    : 0x%08x\n", st->LastStatus);
+    printf("Allocation      : %s at phys 0x%016llx\n",
+           st->TotalSize != 0
+               ? format_size(st->TotalSize, sizebuf, sizeof(sizebuf))
+               : "none",
+           st->SysmemPhys);
+    for (i = 0; i < TTWIND_SYSMEM_ALLOC_TIERS; i++) {
+        printf("  tier %u        : %-24s %s\n", i,
+               format_size(st->TierBytes[i], sizebuf, sizeof(sizebuf)),
+               st->TierResult[i] < 3 ? tier_names[st->TierResult[i]] : "?");
+    }
+    printf("NOC_ID raw      : 0x%08x (x=%u)  -> PCIe tile x = %u\n",
+           st->NocIdRaw, st->NocIdRaw & 0x3F, st->PcieTileX);
+    printf("Verified        : %s\n", st->Verified ? "yes" : "no");
+    if (st->IatuValid) {
+        printf("iATU region 0   : base 0x%08x_%08x  target 0x%08x_%08x\n",
+               st->Iatu[1], st->Iatu[0], st->Iatu[3], st->Iatu[2]);
+        printf("                  limit 0x%08x_%08x  ctrl1 0x%08x  "
+               "ctrl2 0x%08x  ctrl3 0x%08x\n",
+               st->Iatu[5], st->Iatu[4], st->Iatu[6], st->Iatu[7],
+               st->Iatu[8]);
+    } else {
+        printf("iATU region 0   : not read (restricted or BAR2 unmapped)\n");
+    }
+    for (i = 0; i < TTWIND_SYSMEM_LOOPBACK_PROBES; i++) {
+        const TTWIND_SYSMEM_PROBE *p = &st->Probes[i];
+
+        /* Wrote0 is 0x74744D30+i whenever the probe ran. */
+        if (p->Wrote0 == 0) {
+            printf("  probe %u       : not reached\n", i);
+            continue;
+        }
+        printf("  probe %u       : off 0x%09llx  wrote %08x %08x  "
+               "read %08x %08x  %s\n",
+               i, p->Offset, p->Wrote0, p->Wrote1, p->Read0, p->Read1,
+               (p->Read0 == p->Wrote0 && p->Read1 == p->Wrote1)
+                   ? "ok" : "MISMATCH");
+    }
+}
+
 /*
- * sysmem: IOCTL_TTWIND_QUERY_SYSMEM, printed. Exit 0 when sysmem is
- * available, 1 when the driver reports it unavailable, 2 on error.
+ * sysmem: IOCTL_TTWIND_QUERY_SYSMEM plus the SYSMEM_STATUS diagnostic
+ * (which stage of the arm the driver got to, allocation tiers, NOC_ID,
+ * iATU readback, loopback probes). Exit 0 when sysmem is available, 1
+ * when the driver reports it unavailable, 2 on error.
  */
 static int cmd_sysmem(void)
 {
     TTWIND_QUERY_SYSMEM_OUT q;
+    TTWIND_SYSMEM_STATUS_OUT st;
     DWORD returned = 0;
     char sizebuf[64];
     HANDLE h;
@@ -745,19 +808,31 @@ static int cmd_sysmem(void)
     if (q.TotalSize == 0) {
         printf("Sysmem          : unavailable\n");
         rc = 1;
-        goto out_close;
+    } else {
+        printf("Sysmem          : %s\n",
+               format_size(q.TotalSize, sizebuf, sizeof(sizebuf)));
+        printf("NOC address     : 0x%016llx\n", q.NocAddress);
+        printf("Device I/O addr : 0x%016llx\n", q.DeviceIoAddr);
+        printf("Channels        : %u x %s\n", q.ChannelCount,
+               format_size(q.ChannelSize, sizebuf, sizeof(sizebuf)));
+        printf("Max map bytes   : %s\n",
+               format_size(q.MaxMapBytes, sizebuf, sizeof(sizebuf)));
+        printf("PCIe tile       : NOC0 (%u, 0)\n", q.PcieTileX);
+        rc = 0;
     }
 
-    printf("Sysmem          : %s\n",
-           format_size(q.TotalSize, sizebuf, sizeof(sizebuf)));
-    printf("NOC address     : 0x%016llx\n", q.NocAddress);
-    printf("Device I/O addr : 0x%016llx\n", q.DeviceIoAddr);
-    printf("Channels        : %u x %s\n", q.ChannelCount,
-           format_size(q.ChannelSize, sizebuf, sizeof(sizebuf)));
-    printf("Max map bytes   : %s\n",
-           format_size(q.MaxMapBytes, sizebuf, sizeof(sizebuf)));
-    printf("PCIe tile       : NOC0 (%u, 0)\n", q.PcieTileX);
-    rc = 0;
+    if (!DeviceIoControl(h, IOCTL_TTWIND_SYSMEM_STATUS, NULL, 0,
+                         &st, sizeof(st), &returned, NULL)) {
+        /* Diagnostic only; a v100.4.0 driver has no SYSMEM_STATUS. */
+        print_win32_error("SYSMEM_STATUS failed", GetLastError());
+        goto out_close;
+    }
+    if (returned < sizeof(st)) {
+        fprintf(stderr, "short SYSMEM_STATUS reply: %lu bytes\n",
+                returned);
+        goto out_close;
+    }
+    print_sysmem_status(&st);
 
 out_close:
     CloseHandle(h);

@@ -268,6 +268,21 @@ typedef struct _TTWIND_DEVICE_CONTEXT {
     UINT32           PcieTileX;
 
     /*
+     * Sysmem diagnostic bookkeeping (IOCTL_TTWIND_SYSMEM_STATUS):
+     * recorded, never acted on. SysmemTierResult is written once at
+     * allocation (PrepareHardware, before the queue can dispatch); the
+     * rest is (re)written by every arm attempt under ArcLock -
+     * SysmemStage/SysmemLastStatus say how far the LAST attempt got,
+     * SysmemNocIdRaw is the raw NOC_ID readback of its PCIe-instance
+     * detection, SysmemProbes its loopback observations.
+     */
+    UINT32              SysmemStage;      /* TTWIND_SYSMEM_STAGE_*      */
+    UINT32              SysmemLastStatus; /* NTSTATUS of the last arm   */
+    UINT32              SysmemTierResult[TTWIND_SYSMEM_ALLOC_TIERS];
+    UINT32              SysmemNocIdRaw;
+    TTWIND_SYSMEM_PROBE SysmemProbes[TTWIND_SYSMEM_LOOPBACK_PROBES];
+
+    /*
      * Outbound iATU bookkeeping - what each region was last programmed
      * to (v1 uses region 0 only; kept per-region like tt-kmd's
      * outbound_iatus array for when pinning arrives). Written under
@@ -433,3 +448,6 @@ NTSTATUS TtWindIoctlQuerySysmem(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request,
                                 _Out_ size_t *BytesWritten);
 NTSTATUS TtWindIoctlMapSysmem(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request,
                               _Out_ size_t *BytesWritten);
+NTSTATUS TtWindIoctlSysmemStatus(_In_ WDFDEVICE Device,
+                                 _In_ WDFREQUEST Request,
+                                 _Out_ size_t *BytesWritten);

@@ -74,6 +74,7 @@ static const SIZE_T TtWindSysmemTiers[] = {
     512ull * 1024 * 1024,
     256ull * 1024 * 1024,
 };
+C_ASSERT(ARRAYSIZE(TtWindSysmemTiers) == TTWIND_SYSMEM_ALLOC_TIERS);
 
 /* User views of \Device\PhysicalMemory must start on the 64 KiB
  * allocation granularity; sub-granularity offsets are absorbed by
@@ -115,8 +116,10 @@ TtWindSysmemAllocate(
             node);
         if (ctx->SysmemVa != NULL) {
             ctx->SysmemSize = TtWindSysmemTiers[i];
+            ctx->SysmemTierResult[i] = TTWIND_SYSMEM_TIER_OK;
             break;
         }
+        ctx->SysmemTierResult[i] = TTWIND_SYSMEM_TIER_FAILED;
         KdPrint(("ttwind: sysmem tier %Iu bytes unavailable, falling "
                  "back\n", TtWindSysmemTiers[i]));
     }
@@ -238,6 +241,7 @@ TtWindSysmemDetectPcieTile(
 
     nocId = READ_REGISTER_ULONG((volatile ULONG *)
         (Ctx->NocIdRegs + (TTWIND_BH_NOC_ID_OFFSET & 0xFFFu)));
+    Ctx->SysmemNocIdRaw = nocId; /* diagnostic (SYSMEM_STATUS) */
     if (nocId == 0xFFFFFFFFu) {
         return STATUS_DEVICE_DOES_NOT_EXIST;
     }
@@ -296,13 +300,17 @@ TtWindSysmemLoopbackVerify(
     _In_ PTTWIND_DEVICE_CONTEXT Ctx
     )
 {
-    UINT64 offsets[3];
+    UINT64 offsets[TTWIND_SYSMEM_LOOPBACK_PROBES];
     NTSTATUS status = STATUS_SUCCESS;
     ULONG i;
 
     offsets[0] = 0;
     offsets[1] = Ctx->SysmemSize / 2;
     offsets[2] = Ctx->SysmemSize - 4096;
+
+    /* Fresh probe records for this attempt (SYSMEM_STATUS diagnostic);
+     * entries an early failure never reaches stay all-zero. */
+    RtlZeroMemory(Ctx->SysmemProbes, sizeof(Ctx->SysmemProbes));
 
     for (i = 0; i < ARRAYSIZE(offsets); i++) {
         volatile UINT32 *p = (volatile UINT32 *)
@@ -321,6 +329,11 @@ TtWindSysmemLoopbackVerify(
         UINT32 v0 = TtWindSysmemNocRead32(Ctx, noc);
         UINT32 v1;
 
+        Ctx->SysmemProbes[i].Offset = offsets[i];
+        Ctx->SysmemProbes[i].Wrote0 = 0x74744D30u + i;
+        Ctx->SysmemProbes[i].Wrote1 = ~(0x74744D30u + i);
+        Ctx->SysmemProbes[i].Read0 = v0;
+
         if (v0 == 0xFFFFFFFFu) {
             KdPrint(("ttwind: sysmem loopback read all-1s at NOC "
                      "0x%I64X\n", noc));
@@ -328,6 +341,7 @@ TtWindSysmemLoopbackVerify(
             break;
         }
         v1 = TtWindSysmemNocRead32(Ctx, noc + 4);
+        Ctx->SysmemProbes[i].Read1 = v1;
 
         if (v0 != 0x74744D30u + i || v1 != ~(0x74744D30u + i)) {
             KdPrint(("ttwind: sysmem loopback mismatch at offset "
@@ -370,41 +384,53 @@ TtWindSysmemArm(
     ctx->SysmemVerified = FALSE;
 
     if (ctx->NeedsHwInit) {
-        /* Restricted: no MMIO while a reset is in flight (reset.c). */
+        /*
+         * Restricted: no MMIO while a reset is in flight (reset.c).
+         * Not a real attempt - deliberately do NOT overwrite the
+         * recorded stage/status of the last real one.
+         */
         status = STATUS_REINITIALIZATION_NEEDED;
         goto out;
     }
     if (ctx->SysmemVa == NULL) {
+        ctx->SysmemStage = TTWIND_SYSMEM_STAGE_NO_ALLOC;
         status = STATUS_INSUFFICIENT_RESOURCES; /* allocation failed */
-        goto out;
+        goto record;
     }
     if (ctx->Bar2Iatu == NULL || ctx->KernelTlb == NULL ||
         ctx->TlbRegs == NULL) {
+        ctx->SysmemStage = TTWIND_SYSMEM_STAGE_NO_REGS;
         status = STATUS_DEVICE_NOT_READY;
-        goto out;
+        goto record;
     }
 
+    ctx->SysmemStage = TTWIND_SYSMEM_STAGE_TILE_DETECT;
     status = TtWindSysmemDetectPcieTile(ctx);
     if (!NT_SUCCESS(status)) {
-        goto out;
+        goto record;
     }
 
+    ctx->SysmemStage = TTWIND_SYSMEM_STAGE_IATU;
     status = TtWindIatuProgramOutbound(ctx, 0, 0, ctx->SysmemSize - 1,
                                        (UINT64)ctx->SysmemPhys.QuadPart);
     if (!NT_SUCCESS(status)) {
-        goto out;
+        goto record;
     }
 
+    ctx->SysmemStage = TTWIND_SYSMEM_STAGE_LOOPBACK;
     status = TtWindSysmemLoopbackVerify(ctx);
     if (!NT_SUCCESS(status)) {
-        goto out;
+        goto record;
     }
 
+    ctx->SysmemStage = TTWIND_SYSMEM_STAGE_VERIFIED;
     ctx->SysmemVerified = TRUE;
     KdPrint(("ttwind: sysmem armed: %I64u MiB at NOC 0x%I64X via PCIe "
              "tile (%u, 0)\n", ctx->SysmemSize >> 20,
              TTWIND_BH_NOC_PCIE_OFFSET, ctx->PcieTileX));
 
+record:
+    ctx->SysmemLastStatus = (UINT32)status;
 out:
     if (!NT_SUCCESS(status)) {
         KdPrint(("ttwind: sysmem arm failed 0x%08X; sysmem "
@@ -467,6 +493,77 @@ TtWindIoctlQuerySysmem(
         out->MaxMapBytes = (unsigned int)ctx->SysmemSize;
         out->PcieTileX = ctx->PcieTileX;
     }
+    WdfWaitLockRelease(ctx->ArcLock);
+
+    *BytesWritten = sizeof(*out);
+    return STATUS_SUCCESS;
+}
+
+/*
+ * Handler for IOCTL_TTWIND_SYSMEM_STATUS - the diagnostic mirror of the
+ * arm path (the ARC_STATUS pattern): report how far the last arm
+ * attempt got and what it observed, changing nothing. The only hardware
+ * touch is a bounded read-only readback of outbound iATU region 0's
+ * nine registers, skipped (IatuValid = 0) while restricted or when BAR2
+ * is unmapped - the dispatcher already blocks this ioctl while
+ * restricted; the in-handler check is defense in depth.
+ */
+NTSTATUS
+TtWindIoctlSysmemStatus(
+    _In_ WDFDEVICE Device,
+    _In_ WDFREQUEST Request,
+    _Out_ size_t *BytesWritten
+    )
+{
+    PTTWIND_DEVICE_CONTEXT ctx = TtWindGetDeviceContext(Device);
+    TTWIND_SYSMEM_STATUS_OUT *out;
+    ULONG i;
+    NTSTATUS status;
+
+    *BytesWritten = 0;
+
+    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out),
+                                            (PVOID *)&out, NULL);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    RtlZeroMemory(out, sizeof(*out));
+
+    WdfWaitLockAcquire(ctx->ArcLock, NULL);
+
+    out->Stage = ctx->SysmemStage;
+    out->LastStatus = ctx->SysmemLastStatus;
+    out->TotalSize = ctx->SysmemSize;
+    out->SysmemPhys = (unsigned __int64)ctx->SysmemPhys.QuadPart;
+    for (i = 0; i < TTWIND_SYSMEM_ALLOC_TIERS; i++) {
+        out->TierBytes[i] = TtWindSysmemTiers[i];
+        out->TierResult[i] = ctx->SysmemTierResult[i];
+    }
+    out->NocIdRaw = ctx->SysmemNocIdRaw;
+    out->PcieTileX = ctx->PcieTileX;
+    out->Verified = ctx->SysmemVerified ? 1u : 0u;
+
+    RtlCopyMemory(out->Probes, ctx->SysmemProbes, sizeof(out->Probes));
+
+    if (!ctx->NeedsHwInit && ctx->Bar2Iatu != NULL) {
+        /* Live region-0 readback, in the arm path's write order. */
+        static const UINT32 regOrder[TTWIND_SYSMEM_IATU_REGS] = {
+            TTWIND_BH_IATU_LOWER_BASE,   TTWIND_BH_IATU_UPPER_BASE,
+            TTWIND_BH_IATU_LOWER_TARGET, TTWIND_BH_IATU_UPPER_TARGET,
+            TTWIND_BH_IATU_LOWER_LIMIT,  TTWIND_BH_IATU_UPPER_LIMIT,
+            TTWIND_BH_IATU_REGION_CTRL_1, TTWIND_BH_IATU_REGION_CTRL_2,
+            TTWIND_BH_IATU_REGION_CTRL_3,
+        };
+        PUCHAR regs = ctx->Bar2Iatu + TTWIND_BH_IATU_BASE;
+
+        for (i = 0; i < TTWIND_SYSMEM_IATU_REGS; i++) {
+            out->Iatu[i] = READ_REGISTER_ULONG(
+                (volatile ULONG *)(regs + regOrder[i]));
+        }
+        out->IatuValid = 1;
+    }
+
     WdfWaitLockRelease(ctx->ArcLock);
 
     *BytesWritten = sizeof(*out);

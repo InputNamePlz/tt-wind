@@ -65,6 +65,8 @@ DEFINE_GUID(GUID_DEVINTERFACE_TTWIND,
     CTL_CODE(TTWIND_DEVICE_TYPE, 0x80B, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_TTWIND_MAP_SYSMEM \
     CTL_CODE(TTWIND_DEVICE_TYPE, 0x80C, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_TTWIND_SYSMEM_STATUS \
+    CTL_CODE(TTWIND_DEVICE_TYPE, 0x80D, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 /* A PCI device decodes at most six 32-bit BARs. */
 #define TTWIND_MAX_BARS 6u
@@ -297,6 +299,84 @@ typedef struct _TTWIND_MAP_SYSMEM_OUT {
     unsigned __int64 Length;       /* bytes actually mapped             */
 } TTWIND_MAP_SYSMEM_OUT;
 
+/*
+ * Output of IOCTL_TTWIND_SYSMEM_STATUS. No input buffer.
+ *
+ * Diagnostic (the ARC_STATUS pattern): reports exactly how far the last
+ * sysmem arm attempt got and what it observed, so a "sysmem
+ * unavailable" QUERY_SYSMEM can be attributed to a stage. Everything
+ * except the live iATU register readback is bookkeeping recorded by the
+ * allocation/arm paths - reading it changes no driver or device state.
+ * The iATU readback itself is read-only MMIO and is skipped (IatuValid
+ * = 0) while the device is restricted or BAR2 is unmapped. Always
+ * completes with STATUS_SUCCESS once the buffer checks out; the outcome
+ * is in the payload.
+ *
+ * @Stage: TTWIND_SYSMEM_STAGE_* - the stage the last arm attempt was in
+ *      when it stopped: the FAILING stage on failure (LastStatus says
+ *      how), VERIFIED on success, NOT_RUN before the first attempt.
+ * @LastStatus: NTSTATUS of the last arm attempt (0 = success; also 0
+ *      when no arm has run yet - see Stage).
+ * @TotalSize / @SysmemPhys: the achieved contiguous allocation (size 0
+ *      / phys 0 when every tier failed). Valid even when unverified.
+ * @TierBytes / @TierResult: the allocation fallback ladder and each
+ *      tier's outcome (Mm returns no NTSTATUS for a failed contiguous
+ *      allocation, so the per-tier result is an enum, not a status).
+ * @NocIdRaw: raw NOC_ID register value read by the last PCIe-instance
+ *      detection (0 when detection never ran; 0xFFFFFFFF = dead read).
+ * @PcieTileX: detected active PCIe tile x (0 = not detected).
+ * @Verified: current SysmemVerified - 1 iff QUERY_SYSMEM reports the
+ *      buffer.
+ * @IatuValid: 1 when Iatu[] holds a live readback of outbound region
+ *      0's registers, in the write order of the arm path: LOWER_BASE,
+ *      UPPER_BASE, LOWER_TARGET, UPPER_TARGET, LOWER_LIMIT,
+ *      UPPER_LIMIT, REGION_CTRL_1, REGION_CTRL_2, REGION_CTRL_3.
+ * @Probes: the loopback observations of the last arm attempt: per probe
+ *      the buffer offset, the two dwords written through the kernel VA,
+ *      and the two dwords read back over the NOC. All-zero entries were
+ *      not reached (an earlier probe failed first); Read1 is 0 when the
+ *      all-1s early-out on Read0 skipped it.
+ */
+#define TTWIND_SYSMEM_STAGE_NOT_RUN         0u /* arm never attempted   */
+#define TTWIND_SYSMEM_STAGE_NO_ALLOC        1u /* no buffer (all tiers) */
+#define TTWIND_SYSMEM_STAGE_NO_REGS         2u /* BAR2/NOC_ID/TLB unmapped */
+#define TTWIND_SYSMEM_STAGE_TILE_DETECT     3u /* failed detecting PCIe x */
+#define TTWIND_SYSMEM_STAGE_IATU            4u /* iATU programming failed */
+#define TTWIND_SYSMEM_STAGE_LOOPBACK        5u /* loopback failed       */
+#define TTWIND_SYSMEM_STAGE_VERIFIED        6u /* fully armed           */
+
+#define TTWIND_SYSMEM_TIER_NOT_TRIED 0u /* earlier tier succeeded       */
+#define TTWIND_SYSMEM_TIER_FAILED    1u
+#define TTWIND_SYSMEM_TIER_OK        2u
+
+#define TTWIND_SYSMEM_ALLOC_TIERS 3u /* 1 GiB, 512 MiB, 256 MiB */
+#define TTWIND_SYSMEM_LOOPBACK_PROBES 3u
+#define TTWIND_SYSMEM_IATU_REGS 9u
+
+typedef struct _TTWIND_SYSMEM_PROBE {
+    unsigned __int64 Offset;     /* byte offset into the buffer         */
+    unsigned int     Wrote0;
+    unsigned int     Read0;
+    unsigned int     Wrote1;
+    unsigned int     Read1;
+} TTWIND_SYSMEM_PROBE;
+
+typedef struct _TTWIND_SYSMEM_STATUS_OUT {
+    unsigned int     Stage;      /* TTWIND_SYSMEM_STAGE_*               */
+    unsigned int     LastStatus; /* NTSTATUS of the last arm attempt    */
+    unsigned __int64 TotalSize;  /* achieved allocation                 */
+    unsigned __int64 SysmemPhys; /* physical base (diagnostic)          */
+    unsigned __int64 TierBytes[TTWIND_SYSMEM_ALLOC_TIERS];
+    unsigned int     TierResult[TTWIND_SYSMEM_ALLOC_TIERS];
+    unsigned int     NocIdRaw;   /* raw NOC_ID at last detection        */
+    unsigned int     PcieTileX;  /* detected x, 0 if none               */
+    unsigned int     Verified;   /* current SysmemVerified              */
+    unsigned int     IatuValid;  /* 1 = Iatu[] is a live readback       */
+    unsigned int     Iatu[TTWIND_SYSMEM_IATU_REGS]; /* region 0 regs    */
+    TTWIND_SYSMEM_PROBE Probes[TTWIND_SYSMEM_LOOPBACK_PROBES];
+    unsigned int     Reserved[2]; /* zero                               */
+} TTWIND_SYSMEM_STATUS_OUT;
+
 /* --- ARC (SMC) firmware messaging / reset ---------------------------- */
 
 /*
@@ -482,6 +562,8 @@ static_assert(sizeof(TTWIND_CONFIGURE_TLB_IN) == 40, "wire size");
 static_assert(sizeof(TTWIND_MAP_TLB_IN) == 8, "wire size");
 static_assert(sizeof(TTWIND_MAP_TLB_OUT) == 8, "wire size");
 static_assert(sizeof(TTWIND_QUERY_SYSMEM_OUT) == 48, "wire size");
+static_assert(sizeof(TTWIND_SYSMEM_PROBE) == 24, "wire size");
+static_assert(sizeof(TTWIND_SYSMEM_STATUS_OUT) == 192, "wire size");
 static_assert(sizeof(TTWIND_MAP_SYSMEM_IN) == 16, "wire size");
 static_assert(sizeof(TTWIND_MAP_SYSMEM_OUT) == 16, "wire size");
 static_assert(sizeof(TTWIND_SMC_MSG_INOUT) == 32, "wire size");
@@ -501,6 +583,8 @@ C_ASSERT(sizeof(TTWIND_CONFIGURE_TLB_IN) == 40);
 C_ASSERT(sizeof(TTWIND_MAP_TLB_IN) == 8);
 C_ASSERT(sizeof(TTWIND_MAP_TLB_OUT) == 8);
 C_ASSERT(sizeof(TTWIND_QUERY_SYSMEM_OUT) == 48);
+C_ASSERT(sizeof(TTWIND_SYSMEM_PROBE) == 24);
+C_ASSERT(sizeof(TTWIND_SYSMEM_STATUS_OUT) == 192);
 C_ASSERT(sizeof(TTWIND_MAP_SYSMEM_IN) == 16);
 C_ASSERT(sizeof(TTWIND_MAP_SYSMEM_OUT) == 16);
 C_ASSERT(sizeof(TTWIND_SMC_MSG_INOUT) == 32);

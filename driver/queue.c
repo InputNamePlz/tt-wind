@@ -201,6 +201,10 @@ TtWindEvtIoDeviceControl(
         status = TtWindIoctlMapSysmem(device, Request, &bytesWritten);
         break;
 
+    case IOCTL_TTWIND_SYSMEM_STATUS:
+        status = TtWindIoctlSysmemStatus(device, Request, &bytesWritten);
+        break;
+
     case IOCTL_TTWIND_ARC_STATUS:
         status = TtWindIoctlArcStatus(device, Request, &bytesWritten);
         break;
