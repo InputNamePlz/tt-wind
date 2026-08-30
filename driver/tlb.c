@@ -1,0 +1,352 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/*
+ * tlb.c - Blackhole TLB window allocation, configuration, and mapping.
+ *
+ * Blackhole exposes 202 2 MiB TLB windows at the bottom of BAR0 (window
+ * i covers BAR0 offset i * 2 MiB). Each window is steered by a 12-byte
+ * configuration register block at BAR0 + 0x1FC00000 (12 bytes per
+ * window, 2 MiB windows first, then the 4 GiB windows); the layout is
+ * taken from tt-kmd's blackhole.c (struct TLB_2M_REG).
+ *
+ * 2 MiB window register, 96 bits, LSB first:
+ *   address      [ 0..42]  NOC address >> 21
+ *   x_end        [43..48]
+ *   y_end        [49..54]
+ *   x_start      [55..60]
+ *   y_start      [61..66]
+ *   noc          [67..68]
+ *   multicast    [69]
+ *   ordering     [70..71]
+ *   linked       [72]
+ *   use_static_vc[73]
+ *   stream_header[74]      (not exposed; written as 0)
+ *   static_vc    [75..77]  (value field, not exposed; written as 0)
+ *
+ * The first 32 windows additionally have a 4-byte strided-multicast
+ * register (at TLB regs + 2520 + 4*i); like tt-kmd, CONFIGURE_TLB
+ * clears it so a stale strided setup can never alias a fresh config.
+ *
+ * These TLB configuration registers are the ONLY device registers the
+ * kernel writes.
+ *
+ * Ownership: a window belongs to the file object (handle) that
+ * allocated it; only that handle may configure, map, or free it, and
+ * cleanup of the handle releases it (mapping.c). Allocator state lives
+ * in the device context under StateLock.
+ */
+
+#include "ttwind.h"
+
+/*
+ * OR `Value` (masked to Width bits) into a 96-bit register image held
+ * as Lo (bits 0..63) and Hi (bits 64..95). Pos < 64; fields may
+ * straddle the 64-bit boundary.
+ */
+static VOID
+TtWindPutField(
+    _Inout_ UINT64 *Lo,
+    _Inout_ UINT32 *Hi,
+    _In_ UINT32 Pos,
+    _In_ UINT32 Width,
+    _In_ UINT64 Value
+    )
+{
+    UINT64 masked = Value & ((Width >= 64) ? ~0ull : ((1ull << Width) - 1));
+
+    NT_ASSERT(Pos < 64 && Pos + Width <= 96);
+
+    *Lo |= masked << Pos;
+    if (Pos + Width > 64) {
+        *Hi |= (UINT32)(masked >> (64 - Pos));
+    }
+}
+
+/*
+ * Handler for IOCTL_TTWIND_ALLOCATE_TLB.
+ */
+NTSTATUS
+TtWindIoctlAllocateTlb(
+    _In_ WDFDEVICE Device,
+    _In_ WDFREQUEST Request,
+    _Out_ size_t *BytesWritten
+    )
+{
+    PTTWIND_DEVICE_CONTEXT ctx = TtWindGetDeviceContext(Device);
+    WDFFILEOBJECT fileObject = WdfRequestGetFileObject(Request);
+    TTWIND_ALLOCATE_TLB_IN *in;
+    TTWIND_ALLOCATE_TLB_OUT *out;
+    ULONG id;
+    NTSTATUS status;
+
+    *BytesWritten = 0;
+
+    if (fileObject == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+
+    status = WdfRequestRetrieveInputBuffer(Request, sizeof(*in),
+                                           (PVOID *)&in, NULL);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out),
+                                            (PVOID *)&out, NULL);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    /* Only the 2 MiB kind exists for now. */
+    if (in->Size != TTWIND_TLB_WINDOW_SIZE_2M) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    WdfWaitLockAcquire(ctx->StateLock, NULL);
+    id = RtlFindClearBitsAndSet(&ctx->TlbBitmap, 1, 0);
+    if (id != 0xFFFFFFFF) {
+        NT_ASSERT(ctx->TlbOwner[id] == NULL);
+        ctx->TlbOwner[id] = fileObject;
+    }
+    WdfWaitLockRelease(ctx->StateLock);
+
+    if (id == 0xFFFFFFFF) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(out, sizeof(*out));
+    out->TlbId = id;
+    *BytesWritten = sizeof(*out);
+    return STATUS_SUCCESS;
+}
+
+/*
+ * Validate TlbId and ownership. Caller holds StateLock.
+ */
+static NTSTATUS
+TtWindCheckTlbOwner(
+    _In_ PTTWIND_DEVICE_CONTEXT Ctx,
+    _In_ WDFFILEOBJECT FileObject,
+    _In_ UINT32 TlbId
+    )
+{
+    if (TlbId >= TTWIND_BH_TLB_2M_COUNT) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (Ctx->TlbOwner[TlbId] != FileObject) {
+        /* Not allocated, or allocated by another handle. */
+        return STATUS_ACCESS_DENIED;
+    }
+    return STATUS_SUCCESS;
+}
+
+/*
+ * Handler for IOCTL_TTWIND_FREE_TLB.
+ */
+NTSTATUS
+TtWindIoctlFreeTlb(
+    _In_ WDFDEVICE Device,
+    _In_ WDFREQUEST Request
+    )
+{
+    PTTWIND_DEVICE_CONTEXT ctx = TtWindGetDeviceContext(Device);
+    WDFFILEOBJECT fileObject = WdfRequestGetFileObject(Request);
+    TTWIND_FREE_TLB_IN *in;
+    NTSTATUS status;
+
+    if (fileObject == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+
+    status = WdfRequestRetrieveInputBuffer(Request, sizeof(*in),
+                                           (PVOID *)&in, NULL);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    if (in->Reserved != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    WdfWaitLockAcquire(ctx->StateLock, NULL);
+    status = TtWindCheckTlbOwner(ctx, fileObject, in->TlbId);
+    if (NT_SUCCESS(status)) {
+        if (TtWindTlbHasMappings(ctx, (INT32)in->TlbId)) {
+            /* Refuse to free a window that is still user-mapped. */
+            status = STATUS_INVALID_DEVICE_STATE;
+        } else {
+            ctx->TlbOwner[in->TlbId] = NULL;
+            RtlClearBit(&ctx->TlbBitmap, in->TlbId);
+        }
+    }
+    WdfWaitLockRelease(ctx->StateLock);
+
+    return status;
+}
+
+/*
+ * Handler for IOCTL_TTWIND_CONFIGURE_TLB - write the window's config
+ * registers through the kernel's own UC mapping of BAR0.
+ */
+NTSTATUS
+TtWindIoctlConfigureTlb(
+    _In_ WDFDEVICE Device,
+    _In_ WDFREQUEST Request
+    )
+{
+    PTTWIND_DEVICE_CONTEXT ctx = TtWindGetDeviceContext(Device);
+    WDFFILEOBJECT fileObject = WdfRequestGetFileObject(Request);
+    TTWIND_CONFIGURE_TLB_IN *in;
+    const TTWIND_NOC_TLB_CONFIG *cfg;
+    UINT64 lo = 0;
+    UINT32 hi = 0;
+    PUCHAR regs;
+    NTSTATUS status;
+
+    if (fileObject == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+
+    status = WdfRequestRetrieveInputBuffer(Request, sizeof(*in),
+                                           (PVOID *)&in, NULL);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    cfg = &in->Config;
+
+    if (in->Reserved != 0 ||
+        cfg->Reserved0[0] != 0 || cfg->Reserved0[1] != 0 ||
+        cfg->Reserved0[2] != 0 ||
+        cfg->Reserved1[0] != 0 || cfg->Reserved1[1] != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    /* A 2 MiB window can only start on a 2 MiB boundary. */
+    if ((cfg->Addr & (TTWIND_BH_TLB_2M_SIZE - 1)) != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    /* Range-check every field so nothing truncates silently. */
+    if (cfg->XEnd > 0x3F || cfg->YEnd > 0x3F ||
+        cfg->XStart > 0x3F || cfg->YStart > 0x3F ||
+        cfg->Noc > 1 || cfg->Mcast > 1 || cfg->Ordering > 3 ||
+        cfg->Linked > 1 || cfg->StaticVc > 1) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    /* Bit layout per tt-kmd's struct TLB_2M_REG; see file header. */
+    TtWindPutField(&lo, &hi,  0, 43, cfg->Addr >> TTWIND_BH_TLB_2M_SHIFT);
+    TtWindPutField(&lo, &hi, 43,  6, cfg->XEnd);
+    TtWindPutField(&lo, &hi, 49,  6, cfg->YEnd);
+    TtWindPutField(&lo, &hi, 55,  6, cfg->XStart);
+    TtWindPutField(&lo, &hi, 61,  6, cfg->YStart);
+    TtWindPutField(&lo, &hi, 67,  2, cfg->Noc);
+    TtWindPutField(&lo, &hi, 69,  1, cfg->Mcast);
+    TtWindPutField(&lo, &hi, 70,  2, cfg->Ordering);
+    TtWindPutField(&lo, &hi, 72,  1, cfg->Linked);
+    TtWindPutField(&lo, &hi, 73,  1, cfg->StaticVc); /* use_static_vc */
+    /* stream_header and the static_vc value field stay 0. */
+
+    WdfWaitLockAcquire(ctx->StateLock, NULL);
+
+    status = TtWindCheckTlbOwner(ctx, fileObject, in->TlbId);
+    if (NT_SUCCESS(status) && ctx->TlbRegs == NULL) {
+        status = STATUS_DEVICE_NOT_READY;
+    }
+
+    if (NT_SUCCESS(status)) {
+        regs = ctx->TlbRegs + (in->TlbId * TTWIND_BH_TLB_REG_SIZE);
+        WRITE_REGISTER_ULONG((volatile ULONG *)(regs + 0), (ULONG)lo);
+        WRITE_REGISTER_ULONG((volatile ULONG *)(regs + 4), (ULONG)(lo >> 32));
+        WRITE_REGISTER_ULONG((volatile ULONG *)(regs + 8), hi);
+
+        /*
+         * Strided multicast is not exposed through this API; clear any
+         * configuration set by other means (mirrors tt-kmd).
+         */
+        if (in->TlbId < TTWIND_BH_TLB_STRIDED_COUNT) {
+            PUCHAR strided = ctx->TlbRegs +
+                TTWIND_BH_TLB_STRIDED_REGS_OFFSET +
+                (in->TlbId * TTWIND_BH_TLB_STRIDED_REG_SIZE);
+            WRITE_REGISTER_ULONG((volatile ULONG *)strided, 0);
+        }
+    }
+
+    WdfWaitLockRelease(ctx->StateLock);
+    return status;
+}
+
+/*
+ * Handler for IOCTL_TTWIND_MAP_TLB - map the window's 2 MiB slice of
+ * BAR0 into the caller.
+ */
+NTSTATUS
+TtWindIoctlMapTlb(
+    _In_ WDFDEVICE Device,
+    _In_ WDFREQUEST Request,
+    _Out_ size_t *BytesWritten
+    )
+{
+    PTTWIND_DEVICE_CONTEXT ctx = TtWindGetDeviceContext(Device);
+    WDFFILEOBJECT fileObject = WdfRequestGetFileObject(Request);
+    TTWIND_MAP_TLB_IN *in;
+    TTWIND_MAP_TLB_OUT *out;
+    PHYSICAL_ADDRESS phys;
+    UINT64 offset;
+    PVOID userVa;
+    NTSTATUS status;
+
+    *BytesWritten = 0;
+
+    if (fileObject == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+
+    status = WdfRequestRetrieveInputBuffer(Request, sizeof(*in),
+                                           (PVOID *)&in, NULL);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out),
+                                            (PVOID *)&out, NULL);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    if (in->CacheMode != TTWIND_CACHE_UC && in->CacheMode != TTWIND_CACHE_WC) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    /*
+     * Ownership check under the lock; the mapping itself happens after
+     * release. A concurrent FREE_TLB from this same handle could slip
+     * in between, but a handle racing itself only loses its own window;
+     * cross-handle theft is impossible because only the owner can free.
+     */
+    WdfWaitLockAcquire(ctx->StateLock, NULL);
+    status = TtWindCheckTlbOwner(ctx, fileObject, in->TlbId);
+    WdfWaitLockRelease(ctx->StateLock);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    /* The windows sit at the bottom of BAR0; bounds-check against it. */
+    offset = (UINT64)in->TlbId * TTWIND_BH_TLB_2M_SIZE;
+    if (ctx->BarCount == 0 ||
+        offset + TTWIND_BH_TLB_2M_SIZE > ctx->Bars[0].Size) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    phys.QuadPart = ctx->Bars[0].Phys.QuadPart + (LONGLONG)offset;
+
+    status = TtWindCreateUserMapping(Device, Request, phys,
+                                     (SIZE_T)TTWIND_BH_TLB_2M_SIZE,
+                                     in->CacheMode, (INT32)in->TlbId,
+                                     &userVa);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    RtlZeroMemory(out, sizeof(*out));
+    out->UserVa = (unsigned __int64)(ULONG_PTR)userVa;
+    *BytesWritten = sizeof(*out);
+    return STATUS_SUCCESS;
+}

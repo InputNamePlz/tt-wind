@@ -58,6 +58,7 @@ TtWindEvtDeviceAdd(
     )
 {
     WDF_PNPPOWER_EVENT_CALLBACKS pnpCallbacks;
+    WDF_FILEOBJECT_CONFIG fileConfig;
     WDF_OBJECT_ATTRIBUTES attributes;
     WDFDEVICE device;
     NTSTATUS status;
@@ -82,6 +83,20 @@ TtWindEvtDeviceAdd(
      */
     WdfDeviceInitSetIoType(DeviceInit, WdfDeviceIoBuffered);
 
+    /*
+     * Per-handle cleanup: every user mapping and TLB window is owned by
+     * the file object that created it, and EvtFileCleanup tears down
+     * whatever the closing handle still holds. No create/close handlers
+     * are needed - the framework's defaults complete those.
+     */
+    WDF_FILEOBJECT_CONFIG_INIT(&fileConfig,
+                               WDF_NO_EVENT_CALLBACK, /* create  */
+                               WDF_NO_EVENT_CALLBACK, /* close   */
+                               TtWindEvtFileCleanup);
+    WdfDeviceInitSetFileObjectConfig(DeviceInit,
+                                     &fileConfig,
+                                     WDF_NO_OBJECT_ATTRIBUTES);
+
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, TTWIND_DEVICE_CONTEXT);
 
     status = WdfDeviceCreate(&DeviceInit, &attributes, &device);
@@ -90,7 +105,14 @@ TtWindEvtDeviceAdd(
         return status;
     }
 
-    /* Context starts zeroed by the framework; nothing else to set up. */
+    /*
+     * Context starts zeroed by the framework; set up the mapping/TLB
+     * bookkeeping (lists, allocator bitmap, state lock).
+     */
+    status = TtWindMappingInitDevice(device);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
 
     status = TtWindQueueInitialize(device);
     if (!NT_SUCCESS(status)) {

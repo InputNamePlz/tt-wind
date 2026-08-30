@@ -59,11 +59,22 @@
     <Inf2Cat>
       <UseLocalTime>true</UseLocalTime>
     </Inf2Cat>
+    <Inf>
+      <!-- Explicit DriverVer version stamped by stampinf; bump on every
+           interface-visible change so pnputil replaces older installs.
+           Major is pinned at 100 so this always outranks the packages
+           that earlier builds stamped with the default time-derived
+           version (hh.mm.ss.ms, at most 23.x) on a same-date compare;
+           minor tracks the milestone. -->
+      <TimeStamp>100.2.0.0</TimeStamp>
+    </Inf>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="driver.c" />
     <ClCompile Include="device.c" />
     <ClCompile Include="queue.c" />
+    <ClCompile Include="mapping.c" />
+    <ClCompile Include="tlb.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ttwind.h" />

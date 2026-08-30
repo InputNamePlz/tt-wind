@@ -11,6 +11,43 @@
 
 #include "ttwind_ioctl.h"
 
+#define TTWIND_POOL_TAG 'dnWT' /* "TWnd" in the pool viewer */
+
+/*
+ * Blackhole TLB geometry (from tt-kmd blackhole.c). BAR0 starts with 202
+ * 2 MiB windows; the TLB configuration registers live at BAR0 offset
+ * 0x1FC00000, 12 bytes per window (2 MiB windows first, then the eight
+ * 4 GiB windows), followed by one 4-byte strided-multicast register for
+ * each of the first 32 2 MiB windows.
+ */
+#define TTWIND_BH_TLB_2M_COUNT       TTWIND_TLB_2M_WINDOW_COUNT /* 202  */
+#define TTWIND_BH_TLB_2M_SHIFT       21
+#define TTWIND_BH_TLB_2M_SIZE        TTWIND_TLB_WINDOW_SIZE_2M
+#define TTWIND_BH_TLB_4G_COUNT       8u
+#define TTWIND_BH_TLB_REG_SIZE       12u
+#define TTWIND_BH_TLB_REGS_START     0x1FC00000u /* BAR0 offset          */
+#define TTWIND_BH_TLB_REGS_LEN       0x1000u     /* covers all TLB regs  */
+#define TTWIND_BH_TLB_STRIDED_COUNT  32u
+#define TTWIND_BH_TLB_STRIDED_REG_SIZE 4u
+#define TTWIND_BH_TLB_STRIDED_REGS_OFFSET \
+    ((TTWIND_BH_TLB_2M_COUNT + TTWIND_BH_TLB_4G_COUNT) * TTWIND_BH_TLB_REG_SIZE)
+
+/*
+ * One live user-mode mapping of device memory (a BAR range or a TLB
+ * window). Linked into the device context's MappingList; owned by the
+ * file object (handle) that created it and torn down at the latest on
+ * that handle's cleanup, or at ReleaseHardware.
+ */
+typedef struct _TTWIND_USER_MAPPING {
+    LIST_ENTRY    ListEntry;
+    WDFFILEOBJECT FileObject; /* owning handle (comparison only)         */
+    PEPROCESS     Process;    /* referenced; mapping lives in this VA    */
+    PMDL          Mdl;
+    PVOID         UserVa;
+    SIZE_T        Length;
+    INT32         TlbId;      /* window backing this mapping, -1 for BAR */
+} TTWIND_USER_MAPPING, *PTTWIND_USER_MAPPING;
+
 /*
  * Per-device context.
  *
@@ -42,6 +79,26 @@ typedef struct _TTWIND_DEVICE_CONTEXT {
         PHYSICAL_ADDRESS Phys;
         UINT64           Size;
     } Bars[TTWIND_MAX_BARS];
+
+    /*
+     * Kernel UC mapping of the Blackhole TLB configuration registers
+     * (BAR0 + TTWIND_BH_TLB_REGS_START, TTWIND_BH_TLB_REGS_LEN bytes).
+     * Mapped at PrepareHardware, unmapped at ReleaseHardware; NULL while
+     * the device is not started. This is the only device memory the
+     * kernel itself writes.
+     */
+    PUCHAR TlbRegs;
+
+    /*
+     * Shared mapping/TLB state, guarded by StateLock (all users run at
+     * PASSIVE_LEVEL: sequential-queue ioctl handlers, file cleanup, and
+     * ReleaseHardware).
+     */
+    WDFWAITLOCK   StateLock;
+    LIST_ENTRY    MappingList;                        /* TTWIND_USER_MAPPING */
+    RTL_BITMAP    TlbBitmap;                          /* 2M window allocator */
+    ULONG         TlbBitmapBits[(TTWIND_BH_TLB_2M_COUNT + 31) / 32];
+    WDFFILEOBJECT TlbOwner[TTWIND_BH_TLB_2M_COUNT];   /* NULL if free        */
 } TTWIND_DEVICE_CONTEXT, *PTTWIND_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(TTWIND_DEVICE_CONTEXT, TtWindGetDeviceContext)
@@ -57,3 +114,24 @@ EVT_WDF_DEVICE_RELEASE_HARDWARE TtWindEvtDeviceReleaseHardware;
 /* queue.c */
 NTSTATUS TtWindQueueInitialize(_In_ WDFDEVICE Device);
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL TtWindEvtIoDeviceControl;
+
+/* mapping.c */
+NTSTATUS TtWindMappingInitDevice(_In_ WDFDEVICE Device);
+EVT_WDF_FILE_CLEANUP TtWindEvtFileCleanup;
+VOID TtWindRevokeAllMappings(_In_ WDFDEVICE Device);
+NTSTATUS TtWindIoctlMapBar(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request,
+                           _Out_ size_t *BytesWritten);
+NTSTATUS TtWindIoctlUnmapBar(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request);
+NTSTATUS TtWindCreateUserMapping(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request,
+                                 _In_ PHYSICAL_ADDRESS Phys, _In_ SIZE_T Length,
+                                 _In_ UINT32 CacheMode, _In_ INT32 TlbId,
+                                 _Out_ PVOID *OutUserVa);
+BOOLEAN TtWindTlbHasMappings(_In_ PTTWIND_DEVICE_CONTEXT Ctx, _In_ INT32 TlbId);
+
+/* tlb.c */
+NTSTATUS TtWindIoctlAllocateTlb(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request,
+                                _Out_ size_t *BytesWritten);
+NTSTATUS TtWindIoctlFreeTlb(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request);
+NTSTATUS TtWindIoctlConfigureTlb(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request);
+NTSTATUS TtWindIoctlMapTlb(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request,
+                           _Out_ size_t *BytesWritten);

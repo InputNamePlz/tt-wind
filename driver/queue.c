@@ -121,6 +121,30 @@ TtWindEvtIoDeviceControl(
         status = TtWindGetDeviceInfo(device, Request, &bytesWritten);
         break;
 
+    case IOCTL_TTWIND_MAP_BAR:
+        status = TtWindIoctlMapBar(device, Request, &bytesWritten);
+        break;
+
+    case IOCTL_TTWIND_UNMAP_BAR:
+        status = TtWindIoctlUnmapBar(device, Request);
+        break;
+
+    case IOCTL_TTWIND_ALLOCATE_TLB:
+        status = TtWindIoctlAllocateTlb(device, Request, &bytesWritten);
+        break;
+
+    case IOCTL_TTWIND_FREE_TLB:
+        status = TtWindIoctlFreeTlb(device, Request);
+        break;
+
+    case IOCTL_TTWIND_CONFIGURE_TLB:
+        status = TtWindIoctlConfigureTlb(device, Request);
+        break;
+
+    case IOCTL_TTWIND_MAP_TLB:
+        status = TtWindIoctlMapTlb(device, Request, &bytesWritten);
+        break;
+
     default:
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;

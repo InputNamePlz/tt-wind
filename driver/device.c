@@ -214,13 +214,42 @@ TtWindEvtDevicePrepareHardware(
         ctx->BarCount++;
     }
 
+    /*
+     * Map the Blackhole TLB configuration registers (a 4 KiB block high
+     * in BAR0) for kernel use - the only device memory the kernel
+     * itself touches, and only from CONFIGURE_TLB. A device whose BAR0
+     * cannot hold them is not a device this driver can operate.
+     */
+    if (ctx->BarCount == 0 ||
+        ctx->Bars[0].Size <
+            (UINT64)TTWIND_BH_TLB_REGS_START + TTWIND_BH_TLB_REGS_LEN) {
+        KdPrint(("ttwind: BAR0 missing or too small for TLB registers\n"));
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+
+    {
+        PHYSICAL_ADDRESS regsPhys;
+
+        regsPhys.QuadPart = ctx->Bars[0].Phys.QuadPart +
+                            TTWIND_BH_TLB_REGS_START;
+        ctx->TlbRegs = (PUCHAR)MmMapIoSpaceEx(regsPhys,
+                                              TTWIND_BH_TLB_REGS_LEN,
+                                              PAGE_READWRITE | PAGE_NOCACHE);
+        if (ctx->TlbRegs == NULL) {
+            KdPrint(("ttwind: MmMapIoSpaceEx(TLB regs) failed\n"));
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+
     return STATUS_SUCCESS;
 }
 
 /*
  * TtWindEvtDeviceReleaseHardware - undo PrepareHardware.
  *
- * Nothing was mapped, so just forget the recorded resources; identity is
+ * Force-unmap every user mapping first (the BAR physical ranges are
+ * being taken away, so no user view may survive), then drop the kernel
+ * TLB register mapping and forget the recorded resources; identity is
  * left in place for late queries during removal.
  */
 NTSTATUS
@@ -235,6 +264,20 @@ TtWindEvtDeviceReleaseHardware(
     PAGED_CODE();
 
     KdPrint(("ttwind: release hardware\n"));
+
+    TtWindRevokeAllMappings(Device);
+
+    /*
+     * The power-managed default queue is already purged here, so no
+     * CONFIGURE_TLB can be in flight; take the lock anyway so TlbRegs
+     * never changes under a reader.
+     */
+    WdfWaitLockAcquire(ctx->StateLock, NULL);
+    if (ctx->TlbRegs != NULL) {
+        MmUnmapIoSpace(ctx->TlbRegs, TTWIND_BH_TLB_REGS_LEN);
+        ctx->TlbRegs = NULL;
+    }
+    WdfWaitLockRelease(ctx->StateLock);
 
     ctx->BarCount = 0;
     RtlZeroMemory(ctx->Bars, sizeof(ctx->Bars));
