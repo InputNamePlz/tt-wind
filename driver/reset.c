@@ -353,8 +353,14 @@ TtWindIoctlResetDevice(
     /*
      * RESTRICT before ARM: from the instant the trigger below can take
      * effect, no driver path may issue an MMIO access (file header).
+     * Sysmem goes dark with it (the chip's reset clears the iATU;
+     * POST_RESET re-arms after its MMIO gate) - flag only, no MMIO.
+     * The buffer and any surviving user views are host-side and are
+     * untouched; there are no user views here anyway (mapping check
+     * above).
      */
     ctx->NeedsHwInit = TRUE;
+    ctx->SysmemVerified = FALSE;
 
     /*
      * ARM: the interface-timer config writes (pcie.c:133-138). Written
@@ -558,6 +564,17 @@ out:
         }
         TtWindResetStallMs(TTWIND_RESET_POWERUP_RETRY_MS);
     }
+
+    /*
+     * Re-arm sysmem: the chip's reset cleared the iATU, so outbound
+     * region 0 must be reprogrammed and the loopback re-proven before
+     * QUERY_SYSMEM advertises the buffer again. The buffer itself and
+     * its kernel VA survived (host memory); only the on-chip window
+     * needs re-arming. Runs after the power-up like SelfManagedIoInit,
+     * and equally best-effort (a failure leaves sysmem unavailable,
+     * the reset itself still succeeded).
+     */
+    (VOID)TtWindSysmemArm(Device);
 
     return STATUS_SUCCESS;
 }

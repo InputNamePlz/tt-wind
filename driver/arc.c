@@ -837,6 +837,16 @@ TtWindEvtDeviceSelfManagedIoInit(
     } else {
         KdPrint(("ttwind: ARC power-up complete\n"));
     }
+
+    /*
+     * Arm sysmem (program outbound iATU region 0 + loopback
+     * verification, sysmem.c) only now - after the power-up raised
+     * tile power, so the driver's first NOC data traffic runs against
+     * a fully powered chip - and non-fatally: a failure leaves sysmem
+     * unavailable, never a failed start.
+     */
+    (VOID)TtWindSysmemArm(Device);
+
     return STATUS_SUCCESS;
 }
 
@@ -854,6 +864,12 @@ TtWindEvtDeviceSelfManagedIoSuspend(
     _In_ WDFDEVICE Device
     )
 {
+    /*
+     * Sysmem first (flag only, no MMIO): a Dx transition may clear the
+     * iATU, so stop advertising sysmem until Restart re-arms it.
+     */
+    TtWindSysmemInvalidate(Device);
+
     TtWindArcPowerDown(Device);
     return STATUS_SUCCESS;
 }

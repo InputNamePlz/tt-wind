@@ -61,6 +61,10 @@ DEFINE_GUID(GUID_DEVINTERFACE_TTWIND,
     CTL_CODE(TTWIND_DEVICE_TYPE, 0x809, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_TTWIND_POST_RESET \
     CTL_CODE(TTWIND_DEVICE_TYPE, 0x80A, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_TTWIND_QUERY_SYSMEM \
+    CTL_CODE(TTWIND_DEVICE_TYPE, 0x80B, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_TTWIND_MAP_SYSMEM \
+    CTL_CODE(TTWIND_DEVICE_TYPE, 0x80C, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 /* A PCI device decodes at most six 32-bit BARs. */
 #define TTWIND_MAX_BARS 6u
@@ -233,6 +237,66 @@ typedef struct _TTWIND_MAP_TLB_OUT {
     unsigned __int64 UserVa;
 } TTWIND_MAP_TLB_OUT;
 
+/* --- Host system memory (sysmem) ------------------------------------- */
+
+/*
+ * Output of IOCTL_TTWIND_QUERY_SYSMEM. No input buffer.
+ *
+ * The driver allocates one physically contiguous, cached host buffer at
+ * device start and exposes it to the chip through outbound iATU region 0
+ * of the PCIe controller: NOC reads/writes addressed to
+ * [NocAddress, NocAddress + TotalSize) on the PCIe tile land in the
+ * buffer. This is the backing store for tt-metal's command queue.
+ *
+ * @TotalSize: bytes of sysmem, 0 when sysmem is unavailable (allocation
+ *      failed, the iATU could not be programmed, or the loopback
+ *      self-verification failed - including transiently while a reset
+ *      is in flight). All other fields are 0 whenever TotalSize is 0.
+ * @NocAddress: NOC address of byte 0 of the buffer as seen by any tile
+ *      issuing a request to the PCIe tile (Blackhole noc_pcie_offset,
+ *      4 << 58).
+ * @DeviceIoAddr: device-PCIe-space (iATU region base) address of byte 0
+ *      (0 in this version; NocAddress = noc_pcie_offset + DeviceIoAddr).
+ * @ChannelSize: bytes per channel; ChannelCount * ChannelSize ==
+ *      TotalSize. One channel in this version.
+ * @MaxMapBytes: largest Length a single MAP_SYSMEM accepts (the whole
+ *      buffer in this version - section mapping has no MDL size cap).
+ * @PcieTileX: NOC0 x-coordinate of the active PCIe tile (2 or 11 on
+ *      Blackhole, read from the tile's NOC_ID register), y is 0. This
+ *      is the tile to target when reaching sysmem through a TLB window.
+ */
+typedef struct _TTWIND_QUERY_SYSMEM_OUT {
+    unsigned __int64 TotalSize;    /* 0 = sysmem unavailable            */
+    unsigned __int64 NocAddress;   /* 4 << 58                           */
+    unsigned __int64 DeviceIoAddr; /* iATU region base (0)              */
+    unsigned __int64 ChannelSize;  /* == TotalSize (one channel)        */
+    unsigned int     ChannelCount; /* 1                                 */
+    unsigned int     MaxMapBytes;  /* per-MAP_SYSMEM cap (== TotalSize) */
+    unsigned int     PcieTileX;    /* active PCIe tile NOC0 x (y = 0)   */
+    unsigned int     Reserved;     /* zero                              */
+} TTWIND_QUERY_SYSMEM_OUT;
+
+/*
+ * Input of IOCTL_TTWIND_MAP_SYSMEM.
+ *
+ * Maps [Offset, Offset+Length) of the sysmem buffer into the calling
+ * process as one contiguous, CACHED, read/write view (the buffer itself
+ * is cached host RAM; PCIe DMA is cache-coherent on x64). Offset and
+ * Length must be page aligned, Length nonzero, and the range in bounds.
+ * Unmap with IOCTL_TTWIND_UNMAP_BAR (exact UserVa); mappings still live
+ * when the handle closes are torn down automatically.
+ */
+typedef struct _TTWIND_MAP_SYSMEM_IN {
+    unsigned __int64 Offset;       /* byte offset, page aligned         */
+    unsigned __int64 Length;       /* bytes, page aligned, nonzero      */
+} TTWIND_MAP_SYSMEM_IN;
+
+/* Output of IOCTL_TTWIND_MAP_SYSMEM. */
+typedef struct _TTWIND_MAP_SYSMEM_OUT {
+    unsigned __int64 UserVa;       /* base of the new user mapping      */
+    unsigned __int64 Length;       /* bytes actually mapped             */
+} TTWIND_MAP_SYSMEM_OUT;
+
 /* --- ARC (SMC) firmware messaging / reset ---------------------------- */
 
 /*
@@ -290,7 +354,9 @@ typedef struct _TTWIND_SMC_MSG_INOUT {
  * and idempotent (the original config save is kept).
  *
  * RESTRICTED state: until POST_RESET succeeds, only GET_DEVICE_INFO,
- * RESET_DEVICE, and POST_RESET are accepted; every other ioctl fails
+ * QUERY_SYSMEM (which then reports sysmem unavailable without touching
+ * hardware), RESET_DEVICE, and POST_RESET are accepted; every other
+ * ioctl fails
  * with STATUS_REINITIALIZATION_NEEDED before touching hardware. Stale
  * handles (opened before the reset) fail everything with
  * STATUS_DEVICE_REMOVED.
@@ -415,6 +481,9 @@ static_assert(sizeof(TTWIND_NOC_TLB_CONFIG) == 32, "wire size");
 static_assert(sizeof(TTWIND_CONFIGURE_TLB_IN) == 40, "wire size");
 static_assert(sizeof(TTWIND_MAP_TLB_IN) == 8, "wire size");
 static_assert(sizeof(TTWIND_MAP_TLB_OUT) == 8, "wire size");
+static_assert(sizeof(TTWIND_QUERY_SYSMEM_OUT) == 48, "wire size");
+static_assert(sizeof(TTWIND_MAP_SYSMEM_IN) == 16, "wire size");
+static_assert(sizeof(TTWIND_MAP_SYSMEM_OUT) == 16, "wire size");
 static_assert(sizeof(TTWIND_SMC_MSG_INOUT) == 32, "wire size");
 static_assert(sizeof(TTWIND_RESET_DEVICE_IN) == 8, "wire size");
 static_assert(sizeof(TTWIND_POST_RESET_IN) == 8, "wire size");
@@ -431,6 +500,9 @@ C_ASSERT(sizeof(TTWIND_NOC_TLB_CONFIG) == 32);
 C_ASSERT(sizeof(TTWIND_CONFIGURE_TLB_IN) == 40);
 C_ASSERT(sizeof(TTWIND_MAP_TLB_IN) == 8);
 C_ASSERT(sizeof(TTWIND_MAP_TLB_OUT) == 8);
+C_ASSERT(sizeof(TTWIND_QUERY_SYSMEM_OUT) == 48);
+C_ASSERT(sizeof(TTWIND_MAP_SYSMEM_IN) == 16);
+C_ASSERT(sizeof(TTWIND_MAP_SYSMEM_OUT) == 16);
 C_ASSERT(sizeof(TTWIND_SMC_MSG_INOUT) == 32);
 C_ASSERT(sizeof(TTWIND_RESET_DEVICE_IN) == 8);
 C_ASSERT(sizeof(TTWIND_POST_RESET_IN) == 8);

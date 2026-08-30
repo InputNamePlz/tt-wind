@@ -21,6 +21,12 @@
  *                          observations (boot status via all candidate
  *                          routes, selected route, QCB pointer, queue
  *                          geometry).
+ *   sysmem                 QUERY_SYSMEM: print the host sysmem buffer's
+ *                          size/NOC address/PCIe tile (or "unavailable").
+ *   sysmemtest             MAP_SYSMEM the first 1 MiB, write a pattern
+ *                          at offset 0x100 through the cached view, read
+ *                          it back over the NOC via a TLB window at the
+ *                          PCIe tile (4<<58 + 0x100), PASS/FAIL.
  *   reset                  IOCTL_TTWIND_RESET_DEVICE (arm; refused while
  *                          any user mapping exists) then poll
  *                          IOCTL_TTWIND_POST_RESET until recovery.
@@ -710,6 +716,230 @@ out_close:
     return rc;
 }
 
+/*
+ * sysmem: IOCTL_TTWIND_QUERY_SYSMEM, printed. Exit 0 when sysmem is
+ * available, 1 when the driver reports it unavailable, 2 on error.
+ */
+static int cmd_sysmem(void)
+{
+    TTWIND_QUERY_SYSMEM_OUT q;
+    DWORD returned = 0;
+    char sizebuf[64];
+    HANDLE h;
+    int rc = 2;
+
+    h = open_first_device();
+    if (h == INVALID_HANDLE_VALUE)
+        return 2;
+
+    if (!DeviceIoControl(h, IOCTL_TTWIND_QUERY_SYSMEM, NULL, 0,
+                         &q, sizeof(q), &returned, NULL)) {
+        print_win32_error("QUERY_SYSMEM failed", GetLastError());
+        goto out_close;
+    }
+    if (returned < sizeof(q)) {
+        fprintf(stderr, "short QUERY_SYSMEM reply: %lu bytes\n", returned);
+        goto out_close;
+    }
+
+    if (q.TotalSize == 0) {
+        printf("Sysmem          : unavailable\n");
+        rc = 1;
+        goto out_close;
+    }
+
+    printf("Sysmem          : %s\n",
+           format_size(q.TotalSize, sizebuf, sizeof(sizebuf)));
+    printf("NOC address     : 0x%016llx\n", q.NocAddress);
+    printf("Device I/O addr : 0x%016llx\n", q.DeviceIoAddr);
+    printf("Channels        : %u x %s\n", q.ChannelCount,
+           format_size(q.ChannelSize, sizebuf, sizeof(sizebuf)));
+    printf("Max map bytes   : %s\n",
+           format_size(q.MaxMapBytes, sizebuf, sizeof(sizebuf)));
+    printf("PCIe tile       : NOC0 (%u, 0)\n", q.PcieTileX);
+    rc = 0;
+
+out_close:
+    CloseHandle(h);
+    return rc;
+}
+
+/*
+ * sysmemtest: the end-to-end sysmem acceptance test. QUERY_SYSMEM, MAP
+ * the first 1 MiB, write a pattern at offset 0x100 through the cached
+ * user view, then read it back OVER THE NOC - through a user TLB window
+ * aimed at the PCIe tile at NOC address 4<<58 + 0x100 (the outbound
+ * iATU loops it back into the same buffer) - compare, PASS/FAIL,
+ * unmap/free everything.
+ */
+static int cmd_sysmemtest(void)
+{
+    static const unsigned __int64 test_off = 0x100;
+    static const unsigned __int64 win_mask = TTWIND_TLB_WINDOW_SIZE_2M - 1;
+    TTWIND_QUERY_SYSMEM_OUT q;
+    TTWIND_MAP_SYSMEM_IN smap_in;
+    TTWIND_MAP_SYSMEM_OUT smap_out;
+    TTWIND_ALLOCATE_TLB_IN alloc_in;
+    TTWIND_ALLOCATE_TLB_OUT alloc_out;
+    TTWIND_CONFIGURE_TLB_IN cfg_in;
+    TTWIND_MAP_TLB_IN tmap_in;
+    TTWIND_MAP_TLB_OUT tmap_out;
+    TTWIND_UNMAP_BAR_IN unmap_in;
+    TTWIND_FREE_TLB_IN free_in;
+    volatile unsigned int *sysva;
+    volatile unsigned int *nocva;
+    unsigned __int64 noc_addr;
+    unsigned int expect[4];
+    unsigned int got[4];
+    int mismatch = 0;
+    DWORD returned = 0;
+    char sizebuf[64];
+    HANDLE h;
+    int i;
+    int rc = 2;
+    int have_tlbmap = 0;
+
+    memset(&smap_out, 0, sizeof(smap_out));
+    memset(&tmap_out, 0, sizeof(tmap_out));
+    memset(&alloc_out, 0, sizeof(alloc_out));
+
+    h = open_first_device();
+    if (h == INVALID_HANDLE_VALUE)
+        return 2;
+
+    if (!DeviceIoControl(h, IOCTL_TTWIND_QUERY_SYSMEM, NULL, 0,
+                         &q, sizeof(q), &returned, NULL)) {
+        print_win32_error("QUERY_SYSMEM failed", GetLastError());
+        goto out_close;
+    }
+    if (q.TotalSize == 0) {
+        fprintf(stderr, "sysmem unavailable - FAIL\n");
+        goto out_close;
+    }
+    printf("Sysmem %s at NOC 0x%016llx, PCIe tile (%u, 0)\n",
+           format_size(q.TotalSize, sizebuf, sizeof(sizebuf)),
+           q.NocAddress, q.PcieTileX);
+
+    /* Map the first 1 MiB of sysmem (cached, contiguous user VA). */
+    memset(&smap_in, 0, sizeof(smap_in));
+    smap_in.Offset = 0;
+    smap_in.Length = 1024 * 1024;
+    if (!DeviceIoControl(h, IOCTL_TTWIND_MAP_SYSMEM, &smap_in,
+                         sizeof(smap_in), &smap_out, sizeof(smap_out),
+                         &returned, NULL)) {
+        print_win32_error("MAP_SYSMEM failed", GetLastError());
+        goto out_close;
+    }
+    printf("Mapped %s at user VA 0x%llx\n",
+           format_size(smap_out.Length, sizebuf, sizeof(sizebuf)),
+           smap_out.UserVa);
+
+    /* Write the pattern through the cached view. */
+    sysva = (volatile unsigned int *)(ULONG_PTR)
+            (smap_out.UserVa + test_off);
+    for (i = 0; i < 4; i++) {
+        expect[i] = 0x74747335u + (unsigned int)i * 0x01010101u;
+        sysva[i] = expect[i];
+    }
+
+    /* TLB window at the PCIe tile covering NOC 4<<58 + test_off. */
+    noc_addr = q.NocAddress + test_off;
+
+    memset(&alloc_in, 0, sizeof(alloc_in));
+    alloc_in.Size = TTWIND_TLB_WINDOW_SIZE_2M;
+    if (!DeviceIoControl(h, IOCTL_TTWIND_ALLOCATE_TLB, &alloc_in,
+                         sizeof(alloc_in), &alloc_out, sizeof(alloc_out),
+                         &returned, NULL)) {
+        print_win32_error("ALLOCATE_TLB failed", GetLastError());
+        goto out_unmap_sysmem;
+    }
+
+    memset(&cfg_in, 0, sizeof(cfg_in));
+    cfg_in.TlbId = alloc_out.TlbId;
+    cfg_in.Config.Addr = noc_addr & ~win_mask;
+    cfg_in.Config.XEnd = (unsigned short)q.PcieTileX;
+    cfg_in.Config.YEnd = 0;
+    cfg_in.Config.Noc = 0;
+    cfg_in.Config.Ordering = 1; /* strict */
+    if (!DeviceIoControl(h, IOCTL_TTWIND_CONFIGURE_TLB, &cfg_in,
+                         sizeof(cfg_in), NULL, 0, &returned, NULL)) {
+        print_win32_error("CONFIGURE_TLB failed", GetLastError());
+        goto out_free_tlb;
+    }
+
+    memset(&tmap_in, 0, sizeof(tmap_in));
+    tmap_in.TlbId = alloc_out.TlbId;
+    tmap_in.CacheMode = TTWIND_CACHE_UC;
+    if (!DeviceIoControl(h, IOCTL_TTWIND_MAP_TLB, &tmap_in,
+                         sizeof(tmap_in), &tmap_out, sizeof(tmap_out),
+                         &returned, NULL)) {
+        print_win32_error("MAP_TLB failed", GetLastError());
+        goto out_free_tlb;
+    }
+    have_tlbmap = 1;
+
+    /* Read back over the NOC and compare. */
+    nocva = (volatile unsigned int *)(ULONG_PTR)
+            (tmap_out.UserVa + (noc_addr & win_mask));
+    for (i = 0; i < 4; i++) {
+        got[i] = nocva[i];
+        printf("  [0x%llx] wrote 0x%08x  NOC(0x%016llx) read 0x%08x  %s\n",
+               test_off + 4ull * i, expect[i], noc_addr + 4ull * i,
+               got[i], got[i] == expect[i] ? "ok" : "MISMATCH");
+        if (got[i] != expect[i])
+            mismatch = 1;
+    }
+
+    /* Clean the probe bytes up again. */
+    for (i = 0; i < 4; i++)
+        sysva[i] = 0;
+
+    if (mismatch) {
+        printf("sysmemtest: FAIL\n");
+        rc = 1;
+    } else {
+        printf("sysmemtest: PASS\n");
+        rc = 0;
+    }
+
+    memset(&unmap_in, 0, sizeof(unmap_in));
+    unmap_in.UserVa = tmap_out.UserVa;
+    if (!DeviceIoControl(h, IOCTL_TTWIND_UNMAP_BAR, &unmap_in,
+                         sizeof(unmap_in), NULL, 0, &returned, NULL)) {
+        print_win32_error("UNMAP_BAR(tlb) failed", GetLastError());
+        rc = 2;
+    }
+    have_tlbmap = 0;
+
+out_free_tlb:
+    if (have_tlbmap) {
+        memset(&unmap_in, 0, sizeof(unmap_in));
+        unmap_in.UserVa = tmap_out.UserVa;
+        DeviceIoControl(h, IOCTL_TTWIND_UNMAP_BAR, &unmap_in,
+                        sizeof(unmap_in), NULL, 0, &returned, NULL);
+    }
+    memset(&free_in, 0, sizeof(free_in));
+    free_in.TlbId = alloc_out.TlbId;
+    if (!DeviceIoControl(h, IOCTL_TTWIND_FREE_TLB, &free_in,
+                         sizeof(free_in), NULL, 0, &returned, NULL)) {
+        print_win32_error("FREE_TLB failed", GetLastError());
+        rc = 2;
+    }
+
+out_unmap_sysmem:
+    memset(&unmap_in, 0, sizeof(unmap_in));
+    unmap_in.UserVa = smap_out.UserVa;
+    if (!DeviceIoControl(h, IOCTL_TTWIND_UNMAP_BAR, &unmap_in,
+                         sizeof(unmap_in), NULL, 0, &returned, NULL)) {
+        print_win32_error("UNMAP_BAR(sysmem) failed", GetLastError());
+        rc = 2;
+    }
+
+out_close:
+    CloseHandle(h);
+    return rc;
+}
+
 static int usage(void)
 {
     fprintf(stderr,
@@ -721,6 +951,8 @@ static int usage(void)
             "                                         read u32, every TLB field settable\n"
             "       ttwind-info arcmsg <hdr> [w1..w7] send raw ARC/SMC message\n"
             "       ttwind-info arcstatus             probe ARC queue discovery\n"
+            "       ttwind-info sysmem                query host sysmem buffer\n"
+            "       ttwind-info sysmemtest            sysmem write + NOC-readback test\n"
             "       ttwind-info reset                 reset the device\n");
     return 2;
 }
@@ -742,6 +974,10 @@ int main(int argc, char **argv)
             return cmd_arcmsg(argc - 2, argv + 2);
         if (strcmp(argv[1], "arcstatus") == 0 && argc == 2)
             return cmd_arcstatus();
+        if (strcmp(argv[1], "sysmem") == 0 && argc == 2)
+            return cmd_sysmem();
+        if (strcmp(argv[1], "sysmemtest") == 0 && argc == 2)
+            return cmd_sysmemtest();
         if (strcmp(argv[1], "reset") == 0 && argc == 2)
             return cmd_reset();
         return usage();

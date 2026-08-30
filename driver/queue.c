@@ -145,6 +145,7 @@ TtWindEvtIoDeviceControl(
      */
     if (ctx->NeedsHwInit &&
         IoControlCode != IOCTL_TTWIND_GET_DEVICE_INFO &&
+        IoControlCode != IOCTL_TTWIND_QUERY_SYSMEM &&
         IoControlCode != IOCTL_TTWIND_RESET_DEVICE &&
         IoControlCode != IOCTL_TTWIND_POST_RESET) {
         WdfRequestComplete(Request, STATUS_REINITIALIZATION_NEEDED);
@@ -190,6 +191,14 @@ TtWindEvtIoDeviceControl(
 
     case IOCTL_TTWIND_POST_RESET:
         status = TtWindIoctlPostReset(device, Request);
+        break;
+
+    case IOCTL_TTWIND_QUERY_SYSMEM:
+        status = TtWindIoctlQuerySysmem(device, Request, &bytesWritten);
+        break;
+
+    case IOCTL_TTWIND_MAP_SYSMEM:
+        status = TtWindIoctlMapSysmem(device, Request, &bytesWritten);
         break;
 
     case IOCTL_TTWIND_ARC_STATUS:

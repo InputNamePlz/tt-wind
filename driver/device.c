@@ -285,6 +285,57 @@ TtWindEvtDevicePrepareHardware(
         }
     }
 
+    /*
+     * Sysmem support (sysmem.c) - all best-effort: any failure below
+     * leaves sysmem unavailable (QUERY_SYSMEM reports size 0) but never
+     * fails device start.
+     *
+     * 1. The BAR0 page holding the PCIe tile's NOC_ID register (active
+     *    PCIe instance detection). BAR0 covers it whenever it covers
+     *    the TLB registers checked above, but check anyway.
+     */
+    if (ctx->Bars[0].Size >=
+        (UINT64)TTWIND_BH_NOC_ID_PAGE_START + TTWIND_BH_NOC_ID_PAGE_LEN) {
+        PHYSICAL_ADDRESS idPhys;
+
+        idPhys.QuadPart = ctx->Bars[0].Phys.QuadPart +
+                          TTWIND_BH_NOC_ID_PAGE_START;
+        ctx->NocIdRegs = (PUCHAR)MmMapIoSpaceEx(idPhys,
+                                                TTWIND_BH_NOC_ID_PAGE_LEN,
+                                                PAGE_READWRITE | PAGE_NOCACHE);
+        if (ctx->NocIdRegs == NULL) {
+            KdPrint(("ttwind: MmMapIoSpaceEx(NOC_ID page) failed; "
+                     "sysmem will be unavailable\n"));
+        }
+    }
+
+    /*
+     * 2. The outbound iATU register block in BAR2. Bars[] is compact
+     *    (implemented memory BARs in BAR order), so Blackhole's BAR2 is
+     *    entry 1 - BAR0 (entry 0), BAR2 (entry 1), BAR4 (entry 2).
+     */
+    if (ctx->BarCount > TTWIND_BH_BAR2_RESOURCE_INDEX &&
+        ctx->Bars[TTWIND_BH_BAR2_RESOURCE_INDEX].Size >=
+            TTWIND_BH_IATU_REGS_LEN) {
+        PHYSICAL_ADDRESS iatuPhys;
+
+        iatuPhys.QuadPart =
+            ctx->Bars[TTWIND_BH_BAR2_RESOURCE_INDEX].Phys.QuadPart;
+        ctx->Bar2Iatu = (PUCHAR)MmMapIoSpaceEx(iatuPhys,
+                                               TTWIND_BH_IATU_REGS_LEN,
+                                               PAGE_READWRITE | PAGE_NOCACHE);
+        if (ctx->Bar2Iatu == NULL) {
+            KdPrint(("ttwind: MmMapIoSpaceEx(BAR2 iATU) failed; "
+                     "sysmem will be unavailable\n"));
+        }
+    } else {
+        KdPrint(("ttwind: BAR2 missing or too small for the iATU; "
+                 "sysmem will be unavailable\n"));
+    }
+
+    /* 3. The contiguous sysmem buffer itself (1 GiB -> 512 -> 256). */
+    TtWindSysmemAllocate(Device);
+
     return STATUS_SUCCESS;
 }
 
@@ -326,8 +377,23 @@ TtWindEvtDeviceReleaseHardware(
         MmUnmapIoSpace(ctx->ArcApbAxi, TTWIND_BH_ARC_APB_BAR0_LEN);
         ctx->ArcApbAxi = NULL;
     }
+    if (ctx->Bar2Iatu != NULL) {
+        MmUnmapIoSpace(ctx->Bar2Iatu, TTWIND_BH_IATU_REGS_LEN);
+        ctx->Bar2Iatu = NULL;
+    }
+    if (ctx->NocIdRegs != NULL) {
+        MmUnmapIoSpace(ctx->NocIdRegs, TTWIND_BH_NOC_ID_PAGE_LEN);
+        ctx->NocIdRegs = NULL;
+    }
+    ctx->SysmemVerified = FALSE;
     ctx->ArcRoute = TTWIND_ARC_ROUTE_NONE;
     WdfWaitLockRelease(ctx->ArcLock);
+
+    /*
+     * Free the sysmem buffer - AFTER TtWindRevokeAllMappings above has
+     * torn down every user view of it (sysmem.c TtWindSysmemFree).
+     */
+    TtWindSysmemFree(Device);
 
     /*
      * The power-managed default queue is already purged here, so no

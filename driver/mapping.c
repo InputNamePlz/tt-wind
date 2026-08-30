@@ -29,7 +29,10 @@
  * mode (graphics and accelerator drivers); the alternative -
  * ZwMapViewOfSection on \Device\PhysicalMemory - relies on an even less
  * documented section object and makes cache-attribute conflicts easier
- * to create, so the MDL route was chosen.
+ * to create, so the MDL route was chosen for device memory. (The sysmem
+ * buffer - large, cached host RAM - takes the section route instead
+ * precisely because one MDL cannot cover it; see sysmem.c. Those
+ * SECTION-kind records share this file's tracking and teardown.)
  *
  * Process context
  * ---------------
@@ -188,9 +191,34 @@ TtWindMapIoToUser(
 }
 
 /*
+ * Unmap Mapping's user view in the CURRENT process context (the owner,
+ * or attached to it). MDL mappings via MmUnmapLockedPages, section
+ * views (sysmem, sysmem.c) via ZwUnmapViewOfSection on the view base.
+ */
+static VOID
+TtWindUnmapUserView(
+    _In_ PTTWIND_USER_MAPPING Mapping
+    )
+{
+    if (Mapping->Kind == TTWIND_MAPPING_KIND_SECTION) {
+        NTSTATUS status = ZwUnmapViewOfSection(ZwCurrentProcess(),
+                                               Mapping->SectionBase);
+
+        if (!NT_SUCCESS(status)) {
+            KdPrint(("ttwind: ZwUnmapViewOfSection(%p) failed 0x%08X\n",
+                     Mapping->SectionBase, status));
+            NT_ASSERT(FALSE);
+        }
+    } else {
+        MmUnmapLockedPages(Mapping->UserVa, Mapping->Mdl);
+    }
+}
+
+/*
  * Tear down one mapping record: unmap the user view (attaching to the
- * owning process if needed), free the MDL, drop the process reference,
- * free the record. The record must already be off MappingList.
+ * owning process if needed), free the MDL if any, drop the process
+ * reference, free the record. The record must already be off
+ * MappingList.
  */
 static VOID
 TtWindDestroyMapping(
@@ -201,29 +229,33 @@ TtWindDestroyMapping(
 
     if (Mapping->Process == PsGetCurrentProcess()) {
         /* Normal path: cleanup/unmap runs in the owning process. */
-        MmUnmapLockedPages(Mapping->UserVa, Mapping->Mdl);
+        TtWindUnmapUserView(Mapping);
     } else if (PsGetProcessExitStatus(Mapping->Process) == STATUS_PENDING) {
         /*
          * Foreign but live process (duplicated handle, queued request):
          * attach and unmap there.
          */
         KeStackAttachProcess((PRKPROCESS)Mapping->Process, &apcState);
-        MmUnmapLockedPages(Mapping->UserVa, Mapping->Mdl);
+        TtWindUnmapUserView(Mapping);
         KeUnstackDetachProcess(&apcState);
     } else {
         /*
          * The owning process has begun (or finished) termination while
          * some other handle holder kept this record alive. Its address
          * space - including our view - is being torn down by Mm;
-         * MmUnmapLockedPages against a reclaimed VAD would be fatal, so
-         * deliberately skip the unmap and only release our bookkeeping.
+         * unmapping against a reclaimed VAD would be fatal (MDL) or
+         * pointless (section - view teardown is part of the address
+         * space teardown), so deliberately skip the unmap and only
+         * release our bookkeeping.
          */
         KdPrint(("ttwind: owner process of mapping %p exited; "
                  "skipping user unmap\n", Mapping->UserVa));
     }
 
-    Mapping->Mdl->MdlFlags &= ~MDL_PAGES_LOCKED;
-    IoFreeMdl(Mapping->Mdl);
+    if (Mapping->Mdl != NULL) {
+        Mapping->Mdl->MdlFlags &= ~MDL_PAGES_LOCKED;
+        IoFreeMdl(Mapping->Mdl);
+    }
     ObDereferenceObject(Mapping->Process);
     ExFreePoolWithTag(Mapping, TTWIND_POOL_TAG);
 }
@@ -288,6 +320,8 @@ TtWindCreateUserMapping(
 
     mapping->FileObject = fileObject;
     mapping->Process = process;
+    mapping->Kind = TTWIND_MAPPING_KIND_MDL;
+    mapping->SectionBase = NULL;
     mapping->Length = Length;
     mapping->TlbId = TlbId;
 

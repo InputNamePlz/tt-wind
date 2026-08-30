@@ -62,6 +62,55 @@
 #define TTWIND_BH_ARC_APB_BAR0_LEN   0x00100000u
 
 /*
+ * PCIe tile NOC2AXI configuration block in BAR0 (tt-kmd blackhole.c:47-49
+ * NOC2AXI_CFG_START/NOC_ID_OFFSET). The NOC_ID register at CFG + 0x4044
+ * reports the coordinates of the PCIe tile the access came through -
+ * Blackhole has two PCIe instances and the active one's NOC0 x is 2 or
+ * 11 (blackhole_detect_pcie_noc_x, blackhole.c:356-360). Only the one
+ * 4 KiB page holding NOC_ID is mapped.
+ */
+#define TTWIND_BH_NOC2AXI_CFG_START  0x1FD00000u /* BAR0 offset          */
+#define TTWIND_BH_NOC_ID_OFFSET      0x4044u     /* within the CFG block */
+#define TTWIND_BH_NOC_ID_PAGE_START \
+    (TTWIND_BH_NOC2AXI_CFG_START + (TTWIND_BH_NOC_ID_OFFSET & ~0xFFFu))
+#define TTWIND_BH_NOC_ID_PAGE_LEN    0x1000u
+
+/*
+ * Outbound iATU of the PCIe controller, reached through BAR2. Layout
+ * mirrors tt-kmd blackhole.c:86-120: outbound region n's register block
+ * is at BAR2 + IATU_BASE + (2n) * IATU_REGION_STRIDE (the odd strides
+ * are the inbound direction, unused here); 0x3000 covers the base plus
+ * all 16 outbound regions. Register offsets within a block and the
+ * control bits are tt-kmd's IATU_*_OUTBOUND values verbatim.
+ */
+#define TTWIND_BH_BAR2_RESOURCE_INDEX  1u /* Bars[] is compact: 0,2,4    */
+#define TTWIND_BH_IATU_BASE            0x1000u /* BAR2 offset            */
+#define TTWIND_BH_IATU_REGS_LEN        0x3000u /* base + 16 regions      */
+#define TTWIND_BH_IATU_OUTBOUND_REGIONS 16u
+#define TTWIND_BH_IATU_REGION_STRIDE   0x200u  /* 2 * 0x100 (out+in)     */
+#define TTWIND_BH_IATU_REGION_CTRL_1   0x00u
+#define TTWIND_BH_IATU_REGION_CTRL_2   0x04u
+#define TTWIND_BH_IATU_LOWER_BASE      0x08u
+#define TTWIND_BH_IATU_UPPER_BASE      0x0Cu
+#define TTWIND_BH_IATU_LOWER_LIMIT     0x10u
+#define TTWIND_BH_IATU_LOWER_TARGET    0x14u
+#define TTWIND_BH_IATU_UPPER_TARGET    0x18u
+#define TTWIND_BH_IATU_REGION_CTRL_3   0x1Cu
+#define TTWIND_BH_IATU_UPPER_LIMIT     0x20u
+#define TTWIND_BH_IATU_INCREASE_REGION_SIZE (1u << 13) /* CTRL_1 */
+#define TTWIND_BH_IATU_REGION_EN            (1u << 31) /* CTRL_2 */
+#define TTWIND_BH_IATU_MAX_REGION_SIZE (1ull << 40)    /* 1 TiB   */
+
+/*
+ * NOC address of device-PCIe-address 0 as seen on the PCIe tile
+ * (tt-kmd blackhole_class.noc_pcie_offset, blackhole.c:936), and the
+ * highest host physical address the chip can reach (dma_address_bits
+ * 58, blackhole.c:934).
+ */
+#define TTWIND_BH_NOC_PCIE_OFFSET    (4ull << 58)
+#define TTWIND_BH_DMA_ADDRESS_LIMIT  ((1ull << 58) - 1)
+
+/*
  * One ARC (SMC) firmware mailbox message: 8 32-bit words, word 0 is the
  * header (message type in the low byte). Same layout as tt-kmd's
  * struct arc_msg (msgqueue.h).
@@ -72,19 +121,35 @@ typedef struct _TTWIND_ARC_MSG {
 } TTWIND_ARC_MSG, *PTTWIND_ARC_MSG;
 
 /*
+ * How a TTWIND_USER_MAPPING was created, which determines how it is
+ * torn down:
+ *  - MDL: MmMapLockedPagesSpecifyCache over a hand-built I/O-space MDL
+ *    (BAR ranges and TLB windows; mapping.c).
+ *  - SECTION: ZwMapViewOfSection of \Device\PhysicalMemory over the
+ *    driver's contiguous sysmem buffer (sysmem.c); Mdl is NULL and
+ *    SectionBase is the view base handed to ZwUnmapViewOfSection
+ *    (UserVa may sit above it by the sub-64K alignment delta).
+ */
+#define TTWIND_MAPPING_KIND_MDL     0u
+#define TTWIND_MAPPING_KIND_SECTION 1u
+
+/*
  * One live user-mode mapping of device memory (a BAR range or a TLB
- * window). Linked into the device context's MappingList; owned by the
- * file object (handle) that created it and torn down at the latest on
- * that handle's cleanup, or at ReleaseHardware.
+ * window) or of the sysmem buffer. Linked into the device context's
+ * MappingList; owned by the file object (handle) that created it and
+ * torn down at the latest on that handle's cleanup, or at
+ * ReleaseHardware.
  */
 typedef struct _TTWIND_USER_MAPPING {
     LIST_ENTRY    ListEntry;
     WDFFILEOBJECT FileObject; /* owning handle (comparison only)         */
     PEPROCESS     Process;    /* referenced; mapping lives in this VA    */
-    PMDL          Mdl;
+    UINT32        Kind;       /* TTWIND_MAPPING_KIND_*                   */
+    PMDL          Mdl;        /* MDL kind only                           */
+    PVOID         SectionBase;/* SECTION kind only: view base            */
     PVOID         UserVa;
     SIZE_T        Length;
-    INT32         TlbId;      /* window backing this mapping, -1 for BAR */
+    INT32         TlbId;      /* window backing this mapping, -1 if none */
 } TTWIND_USER_MAPPING, *PTTWIND_USER_MAPPING;
 
 /*
@@ -162,11 +227,66 @@ typedef struct _TTWIND_DEVICE_CONTEXT {
     UINT32 ArcRoute;
 
     /*
+     * Kernel UC mapping of the outbound iATU register block in BAR2
+     * (offset 0, TTWIND_BH_IATU_REGS_LEN bytes - the registers start at
+     * TTWIND_BH_IATU_BASE within it). NULL when BAR2 is missing or too
+     * small; sysmem is then unavailable. Mapped at PrepareHardware,
+     * unmapped at ReleaseHardware; written only under ArcLock (the
+     * sysmem arm path).
+     */
+    PUCHAR Bar2Iatu;
+
+    /*
+     * Kernel UC mapping of the 4 KiB BAR0 page holding the PCIe tile's
+     * NOC_ID register (TTWIND_BH_NOC_ID_PAGE_START). NULL when BAR0 is
+     * too small. Read only, under ArcLock.
+     */
+    PUCHAR NocIdRegs;
+
+    /*
+     * Host system memory (sysmem): one physically contiguous, cached,
+     * zeroed buffer allocated at PrepareHardware (1 GiB, falling back
+     * to 512 MiB then 256 MiB) and freed at ReleaseHardware. The chip
+     * reaches it through outbound iATU region 0 at NOC address
+     * TTWIND_BH_NOC_PCIE_OFFSET + offset on the PCIe tile.
+     *
+     * SysmemVa/SysmemPhys/SysmemSize are stable while the device is
+     * started (set before the queue can dispatch, cleared after it is
+     * purged). SysmemVerified is TRUE only after the iATU has been
+     * programmed AND the loopback self-verification passed; it is
+     * cleared when a reset is armed or the device suspends, and
+     * re-established by TtWindSysmemArm. Guarded by ArcLock (writers);
+     * ioctl readers run on the sequential queue and take ArcLock too.
+     *
+     * PcieTileX is the active PCIe instance's NOC0 x-coordinate (2 or
+     * 11), re-read from NOC_ID on every arm; 0 until detected.
+     */
+    PVOID            SysmemVa;
+    PHYSICAL_ADDRESS SysmemPhys;
+    UINT64           SysmemSize;
+    BOOLEAN          SysmemVerified;
+    UINT32           PcieTileX;
+
+    /*
+     * Outbound iATU bookkeeping - what each region was last programmed
+     * to (v1 uses region 0 only; kept per-region like tt-kmd's
+     * outbound_iatus array for when pinning arrives). Written under
+     * ArcLock.
+     */
+    struct {
+        UINT64  Base;
+        UINT64  Limit;
+        UINT64  Target;
+        BOOLEAN Enabled;
+    } OutboundIatu[TTWIND_BH_IATU_OUTBOUND_REGIONS];
+
+    /*
      * NeedsHwInit - TRUE from the moment RESET_DEVICE arms the DBI
      * reset timer until POST_RESET completes the recovery (config
      * restore + first bounded MMIO readback). While TRUE the device is
      * in the RESTRICTED state: the ioctl dispatcher (queue.c) allows
-     * only GET_DEVICE_INFO, RESET_DEVICE, and POST_RESET; every other
+     * only GET_DEVICE_INFO, QUERY_SYSMEM (reports unavailable; no
+     * hardware touched), RESET_DEVICE, and POST_RESET; every other
      * ioctl fails with STATUS_REINITIALIZATION_NEEDED BEFORE touching
      * hardware, and the ARC mailbox path (arc.c, which also serves the
      * SelfManagedIo power callbacks) refuses likewise under ArcLock.
@@ -303,3 +423,13 @@ NTSTATUS TtWindIoctlArcStatus(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request,
 /* reset.c */
 NTSTATUS TtWindIoctlResetDevice(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request);
 NTSTATUS TtWindIoctlPostReset(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request);
+
+/* sysmem.c */
+VOID TtWindSysmemAllocate(_In_ WDFDEVICE Device);
+VOID TtWindSysmemFree(_In_ WDFDEVICE Device);
+NTSTATUS TtWindSysmemArm(_In_ WDFDEVICE Device);
+VOID TtWindSysmemInvalidate(_In_ WDFDEVICE Device);
+NTSTATUS TtWindIoctlQuerySysmem(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request,
+                                _Out_ size_t *BytesWritten);
+NTSTATUS TtWindIoctlMapSysmem(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request,
+                              _Out_ size_t *BytesWritten);
