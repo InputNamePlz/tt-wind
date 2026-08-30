@@ -22,7 +22,7 @@ backend of `tt-kmd-lib`; the stable contract between the two projects is the
 
 ## Scope (first milestones)
 
-1. Device enumeration + identity (open, `GET_DEVICE_INFO` equivalents)
+1. ~~Device enumeration + identity~~ ✅
 2. BAR mapping into user space (UC + WC)
 3. TLB window allocation / configuration / mmap
 4. Reset with user-mapping revocation
