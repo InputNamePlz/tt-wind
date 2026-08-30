@@ -145,6 +145,14 @@ TtWindEvtIoDeviceControl(
         status = TtWindIoctlMapTlb(device, Request, &bytesWritten);
         break;
 
+    case IOCTL_TTWIND_SMC_MSG:
+        status = TtWindIoctlSmcMsg(device, Request, &bytesWritten);
+        break;
+
+    case IOCTL_TTWIND_RESET_DEVICE:
+        status = TtWindIoctlResetDevice(device, Request);
+        break;
+
     default:
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;

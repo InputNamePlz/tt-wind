@@ -53,6 +53,10 @@ DEFINE_GUID(GUID_DEVINTERFACE_TTWIND,
     CTL_CODE(TTWIND_DEVICE_TYPE, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_TTWIND_MAP_TLB \
     CTL_CODE(TTWIND_DEVICE_TYPE, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_TTWIND_SMC_MSG \
+    CTL_CODE(TTWIND_DEVICE_TYPE, 0x807, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_TTWIND_RESET_DEVICE \
+    CTL_CODE(TTWIND_DEVICE_TYPE, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 /* A PCI device decodes at most six 32-bit BARs. */
 #define TTWIND_MAX_BARS 6u
@@ -225,6 +229,53 @@ typedef struct _TTWIND_MAP_TLB_OUT {
     unsigned __int64 UserVa;
 } TTWIND_MAP_TLB_OUT;
 
+/* --- ARC (SMC) firmware messaging / reset ---------------------------- */
+
+/*
+ * Input and output of IOCTL_TTWIND_SMC_MSG.
+ *
+ * One synchronous 8x32-bit message exchange with the ARC (SMC) firmware,
+ * the same wire format as tt-kmd's TENSTORRENT_IOCTL_SMC_MSG (msgqueue.c
+ * `struct arc_msg`): Message[0] is the header (message type in the low
+ * byte; type-specific fields above it), Message[1..7] the payload. The
+ * response overwrites all eight words.
+ *
+ * Unlike the Linux POST/POLL/ABANDON interface this call blocks (bounded
+ * by the driver's internal ~1.5 s timeout) and returns the response
+ * directly; the driver's sequential IOCTL queue serializes concurrent
+ * callers. The driver does NOT interpret the firmware status in the
+ * response Message[0]; a response with a nonzero status still completes
+ * successfully. Errors:
+ *   STATUS_NOT_SUPPORTED         no usable message queue (old firmware)
+ *   STATUS_IO_TIMEOUT            firmware never produced a response
+ *   STATUS_DEVICE_DOES_NOT_EXIST all-1s reads; device is gone/hung
+ *   STATUS_DEVICE_NOT_READY      device not started / firmware not ready
+ */
+typedef struct _TTWIND_SMC_MSG_INOUT {
+    unsigned int Message[8];
+} TTWIND_SMC_MSG_INOUT;
+
+/*
+ * Input of IOCTL_TTWIND_RESET_DEVICE. No output buffer.
+ *
+ * v1 is conservative: the reset is refused with STATUS_DEVICE_BUSY while
+ * ANY user mapping of device memory exists on any handle (the driver has
+ * no way to revoke user page-table entries yet, and a dangling user view
+ * of a BAR across a reset is unacceptable). Unmap everything first.
+ *
+ * The reset itself is tt-kmd's Blackhole "ASIC reset" mechanism: a write
+ * to the device's own config space (DBI interface timer) that makes the
+ * chip reset itself; the driver saves/restores config space around it
+ * and re-sends the power-up firmware messages afterwards. The PCIe link
+ * and the parent bridge are never touched.
+ *
+ * Flags and Reserved must be 0.
+ */
+typedef struct _TTWIND_RESET_DEVICE_IN {
+    unsigned int Flags;          /* must be 0 */
+    unsigned int Reserved;       /* must be 0 */
+} TTWIND_RESET_DEVICE_IN;
+
 #ifdef __cplusplus
 static_assert(sizeof(TTWIND_DEVICE_INFO_OUT) == 120,
               "TTWIND_DEVICE_INFO_OUT wire size changed");
@@ -238,6 +289,8 @@ static_assert(sizeof(TTWIND_NOC_TLB_CONFIG) == 32, "wire size");
 static_assert(sizeof(TTWIND_CONFIGURE_TLB_IN) == 40, "wire size");
 static_assert(sizeof(TTWIND_MAP_TLB_IN) == 8, "wire size");
 static_assert(sizeof(TTWIND_MAP_TLB_OUT) == 8, "wire size");
+static_assert(sizeof(TTWIND_SMC_MSG_INOUT) == 32, "wire size");
+static_assert(sizeof(TTWIND_RESET_DEVICE_IN) == 8, "wire size");
 #else
 C_ASSERT(sizeof(TTWIND_DEVICE_INFO_OUT) == 120);
 C_ASSERT(sizeof(TTWIND_MAP_BAR_IN) == 24);
@@ -250,4 +303,6 @@ C_ASSERT(sizeof(TTWIND_NOC_TLB_CONFIG) == 32);
 C_ASSERT(sizeof(TTWIND_CONFIGURE_TLB_IN) == 40);
 C_ASSERT(sizeof(TTWIND_MAP_TLB_IN) == 8);
 C_ASSERT(sizeof(TTWIND_MAP_TLB_OUT) == 8);
+C_ASSERT(sizeof(TTWIND_SMC_MSG_INOUT) == 32);
+C_ASSERT(sizeof(TTWIND_RESET_DEVICE_IN) == 8);
 #endif

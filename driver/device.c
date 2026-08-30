@@ -61,7 +61,6 @@ TtWindReadPciIdentity(
     _Inout_ PTTWIND_DEVICE_CONTEXT Ctx
     )
 {
-    BUS_INTERFACE_STANDARD busIf;
     PCI_COMMON_HEADER pciHeader;
     ULONG bytesRead;
     ULONG busNumber = 0;
@@ -72,29 +71,32 @@ TtWindReadPciIdentity(
     PAGED_CODE();
 
     /*
-     * The PCI bus driver implements BUS_INTERFACE_STANDARD; GetBusData
-     * reads raw config space. The interface is reference-counted, so
-     * dereference it as soon as the one-shot read is done.
+     * The PCI bus driver implements BUS_INTERFACE_STANDARD; GetBusData/
+     * SetBusData access raw config space. The interface is kept
+     * (referenced) in the device context for the device's started
+     * lifetime: RESET_DEVICE needs config space access long after
+     * PrepareHardware. Dereferenced at ReleaseHardware.
      */
-    status = WdfFdoQueryForInterface(Device,
-                                     &GUID_BUS_INTERFACE_STANDARD,
-                                     (PINTERFACE)&busIf,
-                                     sizeof(busIf),
-                                     1, /* version */
-                                     NULL);
-    if (!NT_SUCCESS(status)) {
-        KdPrint(("ttwind: BUS_INTERFACE_STANDARD query failed 0x%08X\n",
-                 status));
-        return status;
+    if (!Ctx->BusIfValid) {
+        status = WdfFdoQueryForInterface(Device,
+                                         &GUID_BUS_INTERFACE_STANDARD,
+                                         (PINTERFACE)&Ctx->BusIf,
+                                         sizeof(Ctx->BusIf),
+                                         1, /* version */
+                                         NULL);
+        if (!NT_SUCCESS(status)) {
+            KdPrint(("ttwind: BUS_INTERFACE_STANDARD query failed 0x%08X\n",
+                     status));
+            return status;
+        }
+        Ctx->BusIfValid = TRUE;
     }
 
-    bytesRead = busIf.GetBusData(busIf.Context,
-                                 PCI_WHICH_SPACE_CONFIG,
-                                 &pciHeader,
-                                 0,
-                                 sizeof(pciHeader));
-
-    busIf.InterfaceDereference(busIf.Context);
+    bytesRead = Ctx->BusIf.GetBusData(Ctx->BusIf.Context,
+                                      PCI_WHICH_SPACE_CONFIG,
+                                      &pciHeader,
+                                      0,
+                                      sizeof(pciHeader));
 
     if (bytesRead != sizeof(pciHeader)) {
         KdPrint(("ttwind: short config space read (%lu bytes)\n", bytesRead));
@@ -241,6 +243,28 @@ TtWindEvtDevicePrepareHardware(
         }
     }
 
+    /*
+     * Map the reserved kernel TLB window (topmost 2 MiB window of BAR0)
+     * for kernel-initiated NOC access - the ARC firmware mailbox and
+     * scratch registers (arc.c). Its start lies below the TLB register
+     * block, so the BAR0 size check above already covers it.
+     */
+    {
+        PHYSICAL_ADDRESS winPhys;
+
+        winPhys.QuadPart = ctx->Bars[0].Phys.QuadPart +
+                           (LONGLONG)TTWIND_BH_KERNEL_TLB_START;
+        ctx->KernelTlb = (PUCHAR)MmMapIoSpaceEx(winPhys,
+                                                TTWIND_BH_TLB_2M_SIZE,
+                                                PAGE_READWRITE | PAGE_NOCACHE);
+        if (ctx->KernelTlb == NULL) {
+            KdPrint(("ttwind: MmMapIoSpaceEx(kernel TLB window) failed\n"));
+            MmUnmapIoSpace(ctx->TlbRegs, TTWIND_BH_TLB_REGS_LEN);
+            ctx->TlbRegs = NULL;
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -268,6 +292,19 @@ TtWindEvtDeviceReleaseHardware(
     TtWindRevokeAllMappings(Device);
 
     /*
+     * The ARC mailbox path checks KernelTlb/TlbRegs under ArcLock; the
+     * SelfManagedIoSuspend power-down and queue purge have already
+     * happened, so nothing can be mid-exchange, but take the lock so
+     * the pointers never change under a reader.
+     */
+    WdfWaitLockAcquire(ctx->ArcLock, NULL);
+    if (ctx->KernelTlb != NULL) {
+        MmUnmapIoSpace(ctx->KernelTlb, TTWIND_BH_TLB_2M_SIZE);
+        ctx->KernelTlb = NULL;
+    }
+    WdfWaitLockRelease(ctx->ArcLock);
+
+    /*
      * The power-managed default queue is already purged here, so no
      * CONFIGURE_TLB can be in flight; take the lock anyway so TlbRegs
      * never changes under a reader.
@@ -278,6 +315,11 @@ TtWindEvtDeviceReleaseHardware(
         ctx->TlbRegs = NULL;
     }
     WdfWaitLockRelease(ctx->StateLock);
+
+    if (ctx->BusIfValid) {
+        ctx->BusIf.InterfaceDereference(ctx->BusIf.Context);
+        ctx->BusIfValid = FALSE;
+    }
 
     ctx->BarCount = 0;
     RtlZeroMemory(ctx->Bars, sizeof(ctx->Bars));

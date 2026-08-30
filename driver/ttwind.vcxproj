@@ -66,7 +66,7 @@
            that earlier builds stamped with the default time-derived
            version (hh.mm.ss.ms, at most 23.x) on a same-date compare;
            minor tracks the milestone. -->
-      <TimeStamp>100.2.0.0</TimeStamp>
+      <TimeStamp>100.3.0.0</TimeStamp>
     </Inf>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -75,6 +75,8 @@
     <ClCompile Include="queue.c" />
     <ClCompile Include="mapping.c" />
     <ClCompile Include="tlb.c" />
+    <ClCompile Include="arc.c" />
+    <ClCompile Include="reset.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ttwind.h" />

@@ -74,6 +74,19 @@ TtWindEvtDeviceAdd(
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpCallbacks);
     pnpCallbacks.EvtDevicePrepareHardware = TtWindEvtDevicePrepareHardware;
     pnpCallbacks.EvtDeviceReleaseHardware = TtWindEvtDeviceReleaseHardware;
+
+    /*
+     * SelfManagedIo callbacks carry the ARC firmware power messages:
+     * Init/Restart raise the ASIC and tile power after every (re)start,
+     * Suspend lowers it before every stop/sleep. See arc.c for why this
+     * stage (and not PrepareHardware) was chosen.
+     */
+    pnpCallbacks.EvtDeviceSelfManagedIoInit =
+        TtWindEvtDeviceSelfManagedIoInit;
+    pnpCallbacks.EvtDeviceSelfManagedIoRestart =
+        TtWindEvtDeviceSelfManagedIoRestart;
+    pnpCallbacks.EvtDeviceSelfManagedIoSuspend =
+        TtWindEvtDeviceSelfManagedIoSuspend;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpCallbacks);
 
     /*

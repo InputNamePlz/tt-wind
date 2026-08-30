@@ -62,6 +62,61 @@ TtWindPutField(
 }
 
 /*
+ * TtWindProgramTlb2M - pack Cfg per tt-kmd's struct TLB_2M_REG (see the
+ * file header) and write window TlbId's configuration registers.
+ *
+ * No validation here: the caller has validated Cfg (ioctl path) or
+ * built it from constants (kernel ARC path, arc.c). The caller also
+ * provides serialization for the window it programs: user windows
+ * (0..200) are written under StateLock, the kernel window (201) under
+ * ArcLock; the register blocks are disjoint, so the two lock domains
+ * never touch the same registers. Ctx->TlbRegs must be mapped.
+ */
+VOID
+TtWindProgramTlb2M(
+    _In_ PTTWIND_DEVICE_CONTEXT Ctx,
+    _In_ UINT32 TlbId,
+    _In_ const TTWIND_NOC_TLB_CONFIG *Cfg
+    )
+{
+    UINT64 lo = 0;
+    UINT32 hi = 0;
+    PUCHAR regs;
+
+    NT_ASSERT(TlbId < TTWIND_BH_TLB_2M_COUNT);
+    NT_ASSERT(Ctx->TlbRegs != NULL);
+
+    /* Bit layout per tt-kmd's struct TLB_2M_REG; see file header. */
+    TtWindPutField(&lo, &hi,  0, 43, Cfg->Addr >> TTWIND_BH_TLB_2M_SHIFT);
+    TtWindPutField(&lo, &hi, 43,  6, Cfg->XEnd);
+    TtWindPutField(&lo, &hi, 49,  6, Cfg->YEnd);
+    TtWindPutField(&lo, &hi, 55,  6, Cfg->XStart);
+    TtWindPutField(&lo, &hi, 61,  6, Cfg->YStart);
+    TtWindPutField(&lo, &hi, 67,  2, Cfg->Noc);
+    TtWindPutField(&lo, &hi, 69,  1, Cfg->Mcast);
+    TtWindPutField(&lo, &hi, 70,  2, Cfg->Ordering);
+    TtWindPutField(&lo, &hi, 72,  1, Cfg->Linked);
+    TtWindPutField(&lo, &hi, 73,  1, Cfg->StaticVc); /* use_static_vc */
+    /* stream_header and the static_vc value field stay 0. */
+
+    regs = Ctx->TlbRegs + (TlbId * TTWIND_BH_TLB_REG_SIZE);
+    WRITE_REGISTER_ULONG((volatile ULONG *)(regs + 0), (ULONG)lo);
+    WRITE_REGISTER_ULONG((volatile ULONG *)(regs + 4), (ULONG)(lo >> 32));
+    WRITE_REGISTER_ULONG((volatile ULONG *)(regs + 8), hi);
+
+    /*
+     * Strided multicast is not exposed through this API; clear any
+     * configuration set by other means (mirrors tt-kmd).
+     */
+    if (TlbId < TTWIND_BH_TLB_STRIDED_COUNT) {
+        PUCHAR strided = Ctx->TlbRegs +
+            TTWIND_BH_TLB_STRIDED_REGS_OFFSET +
+            (TlbId * TTWIND_BH_TLB_STRIDED_REG_SIZE);
+        WRITE_REGISTER_ULONG((volatile ULONG *)strided, 0);
+    }
+}
+
+/*
  * Handler for IOCTL_TTWIND_ALLOCATE_TLB.
  */
 NTSTATUS
@@ -195,9 +250,6 @@ TtWindIoctlConfigureTlb(
     WDFFILEOBJECT fileObject = WdfRequestGetFileObject(Request);
     TTWIND_CONFIGURE_TLB_IN *in;
     const TTWIND_NOC_TLB_CONFIG *cfg;
-    UINT64 lo = 0;
-    UINT32 hi = 0;
-    PUCHAR regs;
     NTSTATUS status;
 
     if (fileObject == NULL) {
@@ -232,19 +284,6 @@ TtWindIoctlConfigureTlb(
         return STATUS_INVALID_PARAMETER;
     }
 
-    /* Bit layout per tt-kmd's struct TLB_2M_REG; see file header. */
-    TtWindPutField(&lo, &hi,  0, 43, cfg->Addr >> TTWIND_BH_TLB_2M_SHIFT);
-    TtWindPutField(&lo, &hi, 43,  6, cfg->XEnd);
-    TtWindPutField(&lo, &hi, 49,  6, cfg->YEnd);
-    TtWindPutField(&lo, &hi, 55,  6, cfg->XStart);
-    TtWindPutField(&lo, &hi, 61,  6, cfg->YStart);
-    TtWindPutField(&lo, &hi, 67,  2, cfg->Noc);
-    TtWindPutField(&lo, &hi, 69,  1, cfg->Mcast);
-    TtWindPutField(&lo, &hi, 70,  2, cfg->Ordering);
-    TtWindPutField(&lo, &hi, 72,  1, cfg->Linked);
-    TtWindPutField(&lo, &hi, 73,  1, cfg->StaticVc); /* use_static_vc */
-    /* stream_header and the static_vc value field stay 0. */
-
     WdfWaitLockAcquire(ctx->StateLock, NULL);
 
     status = TtWindCheckTlbOwner(ctx, fileObject, in->TlbId);
@@ -253,21 +292,7 @@ TtWindIoctlConfigureTlb(
     }
 
     if (NT_SUCCESS(status)) {
-        regs = ctx->TlbRegs + (in->TlbId * TTWIND_BH_TLB_REG_SIZE);
-        WRITE_REGISTER_ULONG((volatile ULONG *)(regs + 0), (ULONG)lo);
-        WRITE_REGISTER_ULONG((volatile ULONG *)(regs + 4), (ULONG)(lo >> 32));
-        WRITE_REGISTER_ULONG((volatile ULONG *)(regs + 8), hi);
-
-        /*
-         * Strided multicast is not exposed through this API; clear any
-         * configuration set by other means (mirrors tt-kmd).
-         */
-        if (in->TlbId < TTWIND_BH_TLB_STRIDED_COUNT) {
-            PUCHAR strided = ctx->TlbRegs +
-                TTWIND_BH_TLB_STRIDED_REGS_OFFSET +
-                (in->TlbId * TTWIND_BH_TLB_STRIDED_REG_SIZE);
-            WRITE_REGISTER_ULONG((volatile ULONG *)strided, 0);
-        }
+        TtWindProgramTlb2M(ctx, in->TlbId, cfg);
     }
 
     WdfWaitLockRelease(ctx->StateLock);

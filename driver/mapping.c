@@ -79,12 +79,27 @@ TtWindMappingInitDevice(
                         TTWIND_BH_TLB_2M_COUNT);
     RtlClearAllBits(&ctx->TlbBitmap);
 
+    /*
+     * The topmost 2 MiB window is the kernel's (ARC mailbox access,
+     * arc.c); permanently allocated so no user handle can take it. Its
+     * TlbOwner slot stays NULL, so ownership checks reject every user
+     * operation on it.
+     */
+    RtlSetBit(&ctx->TlbBitmap, TTWIND_BH_KERNEL_TLB_INDEX);
+
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
     attributes.ParentObject = Device;
 
     status = WdfWaitLockCreate(&attributes, &ctx->StateLock);
     if (!NT_SUCCESS(status)) {
         KdPrint(("ttwind: WdfWaitLockCreate failed 0x%08X\n", status));
+        return status;
+    }
+
+    status = WdfWaitLockCreate(&attributes, &ctx->ArcLock);
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("ttwind: WdfWaitLockCreate(ArcLock) failed 0x%08X\n",
+                 status));
     }
     return status;
 }
@@ -514,6 +529,8 @@ TtWindRevokeAllMappings(
         ctx->TlbOwner[i] = NULL;
     }
     RtlClearAllBits(&ctx->TlbBitmap);
+    /* The kernel window reservation survives every revocation. */
+    RtlSetBit(&ctx->TlbBitmap, TTWIND_BH_KERNEL_TLB_INDEX);
     WdfWaitLockRelease(ctx->StateLock);
 
     while (!IsListEmpty(&toDestroy)) {

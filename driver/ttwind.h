@@ -33,6 +33,26 @@
     ((TTWIND_BH_TLB_2M_COUNT + TTWIND_BH_TLB_4G_COUNT) * TTWIND_BH_TLB_REG_SIZE)
 
 /*
+ * The topmost 2 MiB TLB window is reserved for the kernel's own NOC
+ * access (ARC firmware messaging); tt-kmd reserves the same window
+ * (blackhole.c KERNEL_TLB_INDEX). It is pre-set in the allocator bitmap
+ * so user handles can never allocate or map it.
+ */
+#define TTWIND_BH_KERNEL_TLB_INDEX  (TTWIND_BH_TLB_2M_COUNT - 1)
+#define TTWIND_BH_KERNEL_TLB_START \
+    ((UINT64)TTWIND_BH_KERNEL_TLB_INDEX * TTWIND_BH_TLB_2M_SIZE)
+
+/*
+ * One ARC (SMC) firmware mailbox message: 8 32-bit words, word 0 is the
+ * header (message type in the low byte). Same layout as tt-kmd's
+ * struct arc_msg (msgqueue.h).
+ */
+typedef struct _TTWIND_ARC_MSG {
+    UINT32 Header;
+    UINT32 Payload[7];
+} TTWIND_ARC_MSG, *PTTWIND_ARC_MSG;
+
+/*
  * One live user-mode mapping of device memory (a BAR range or a TLB
  * window). Linked into the device context's MappingList; owned by the
  * file object (handle) that created it and torn down at the latest on
@@ -90,6 +110,31 @@ typedef struct _TTWIND_DEVICE_CONTEXT {
     PUCHAR TlbRegs;
 
     /*
+     * Kernel UC mapping of the reserved kernel TLB window (BAR0 +
+     * TTWIND_BH_KERNEL_TLB_START, 2 MiB). All kernel-initiated NOC
+     * traffic (ARC mailbox, scratch registers) goes through this window.
+     * Mapped at PrepareHardware, unmapped at ReleaseHardware; NULL while
+     * the device is not started. Guarded by ArcLock.
+     */
+    PUCHAR KernelTlb;
+
+    /*
+     * ArcLock serializes ALL use of the ARC mailbox and of the kernel
+     * TLB window (every kernel NOC access reprograms the window). Taken
+     * at PASSIVE_LEVEL only; ordered after nothing (never acquired while
+     * holding StateLock and vice versa).
+     */
+    WDFWAITLOCK ArcLock;
+
+    /*
+     * Config-space access to this function via the parent bus driver.
+     * Queried (referenced) at PrepareHardware, dereferenced at
+     * ReleaseHardware. Valid only while BusIfValid.
+     */
+    BUS_INTERFACE_STANDARD BusIf;
+    BOOLEAN BusIfValid;
+
+    /*
      * Shared mapping/TLB state, guarded by StateLock (all users run at
      * PASSIVE_LEVEL: sequential-queue ioctl handlers, file cleanup, and
      * ReleaseHardware).
@@ -135,3 +180,19 @@ NTSTATUS TtWindIoctlFreeTlb(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request);
 NTSTATUS TtWindIoctlConfigureTlb(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request);
 NTSTATUS TtWindIoctlMapTlb(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request,
                            _Out_ size_t *BytesWritten);
+VOID TtWindProgramTlb2M(_In_ PTTWIND_DEVICE_CONTEXT Ctx, _In_ UINT32 TlbId,
+                        _In_ const TTWIND_NOC_TLB_CONFIG *Cfg);
+
+/* arc.c */
+EVT_WDF_DEVICE_SELF_MANAGED_IO_INIT TtWindEvtDeviceSelfManagedIoInit;
+EVT_WDF_DEVICE_SELF_MANAGED_IO_RESTART TtWindEvtDeviceSelfManagedIoRestart;
+EVT_WDF_DEVICE_SELF_MANAGED_IO_SUSPEND TtWindEvtDeviceSelfManagedIoSuspend;
+NTSTATUS TtWindArcMsgSendSync(_In_ WDFDEVICE Device,
+                              _Inout_ PTTWIND_ARC_MSG Msg);
+NTSTATUS TtWindArcPowerUp(_In_ WDFDEVICE Device);
+VOID TtWindArcPowerDown(_In_ WDFDEVICE Device);
+NTSTATUS TtWindIoctlSmcMsg(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request,
+                           _Out_ size_t *BytesWritten);
+
+/* reset.c */
+NTSTATUS TtWindIoctlResetDevice(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request);
