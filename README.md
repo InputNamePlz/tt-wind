@@ -33,7 +33,9 @@ upstream).
 
 ## Building
 
-Requires Visual Studio 2022 + Windows Driver Kit (WDK). TODO.
+Requires Visual Studio 2022 Build Tools + Windows Driver Kit (WDK). See
+[docs/building.md](docs/building.md) for the exact commands (MSBuild on
+`ttwind.sln`, x64).
 
 ## License
 
