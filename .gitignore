@@ -1,0 +1,7 @@
+build/
+x64/
+.vs/
+*.user
+*.log
+*.cer
+*.pfx
