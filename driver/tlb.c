@@ -75,6 +75,36 @@ TtWindPutField(
 }
 
 /*
+ * Pack Cfg into the 96-bit TLB_2M_REG image (Lo = bits 0..63, Hi =
+ * bits 64..95) per tt-kmd's struct TLB_2M_REG; see the file header.
+ */
+static VOID
+TtWindPackTlb2M(
+    _In_ const TTWIND_NOC_TLB_CONFIG *Cfg,
+    _Out_ UINT64 *Lo,
+    _Out_ UINT32 *Hi
+    )
+{
+    UINT64 lo = 0;
+    UINT32 hi = 0;
+
+    TtWindPutField(&lo, &hi,  0, 43, Cfg->Addr >> TTWIND_BH_TLB_2M_SHIFT);
+    TtWindPutField(&lo, &hi, 43,  6, Cfg->XEnd);
+    TtWindPutField(&lo, &hi, 49,  6, Cfg->YEnd);
+    TtWindPutField(&lo, &hi, 55,  6, Cfg->XStart);
+    TtWindPutField(&lo, &hi, 61,  6, Cfg->YStart);
+    TtWindPutField(&lo, &hi, 67,  2, Cfg->Noc);
+    TtWindPutField(&lo, &hi, 69,  1, Cfg->Mcast);
+    TtWindPutField(&lo, &hi, 70,  2, Cfg->Ordering);
+    TtWindPutField(&lo, &hi, 72,  1, Cfg->Linked);
+    TtWindPutField(&lo, &hi, 73,  1, Cfg->StaticVc); /* use_static_vc */
+    /* stream_header and the static_vc value field stay 0. */
+
+    *Lo = lo;
+    *Hi = hi;
+}
+
+/*
  * TtWindProgramTlb2M - pack Cfg per tt-kmd's struct TLB_2M_REG (see the
  * file header) and write window TlbId's configuration registers.
  *
@@ -92,25 +122,14 @@ TtWindProgramTlb2M(
     _In_ const TTWIND_NOC_TLB_CONFIG *Cfg
     )
 {
-    UINT64 lo = 0;
-    UINT32 hi = 0;
+    UINT64 lo;
+    UINT32 hi;
     PUCHAR regs;
 
     NT_ASSERT(TlbId < TTWIND_BH_TLB_2M_COUNT);
     NT_ASSERT(Ctx->TlbRegs != NULL);
 
-    /* Bit layout per tt-kmd's struct TLB_2M_REG; see file header. */
-    TtWindPutField(&lo, &hi,  0, 43, Cfg->Addr >> TTWIND_BH_TLB_2M_SHIFT);
-    TtWindPutField(&lo, &hi, 43,  6, Cfg->XEnd);
-    TtWindPutField(&lo, &hi, 49,  6, Cfg->YEnd);
-    TtWindPutField(&lo, &hi, 55,  6, Cfg->XStart);
-    TtWindPutField(&lo, &hi, 61,  6, Cfg->YStart);
-    TtWindPutField(&lo, &hi, 67,  2, Cfg->Noc);
-    TtWindPutField(&lo, &hi, 69,  1, Cfg->Mcast);
-    TtWindPutField(&lo, &hi, 70,  2, Cfg->Ordering);
-    TtWindPutField(&lo, &hi, 72,  1, Cfg->Linked);
-    TtWindPutField(&lo, &hi, 73,  1, Cfg->StaticVc); /* use_static_vc */
-    /* stream_header and the static_vc value field stay 0. */
+    TtWindPackTlb2M(Cfg, &lo, &hi);
 
     regs = Ctx->TlbRegs + (TlbId * TTWIND_BH_TLB_REG_SIZE);
     WRITE_REGISTER_ULONG((volatile ULONG *)(regs + 0), (ULONG)lo);
@@ -127,6 +146,70 @@ TtWindProgramTlb2M(
             (TlbId * TTWIND_BH_TLB_STRIDED_REG_SIZE);
         WRITE_REGISTER_ULONG((volatile ULONG *)strided, 0);
     }
+}
+
+/*
+ * TtWindKernelTlbSanityCheck - one bounded known-good MMIO round trip.
+ *
+ * Programs the reserved kernel TLB window's configuration registers (a
+ * BAR0 register block, no NOC traffic involved) with a distinctive
+ * pattern (ARC tile (8,0), strict ordering - the exact config arc.c
+ * uses) and reads the three dwords back. A healthy device echoes the
+ * written values; a device whose MMIO decode is wedged returns all-1s
+ * (completion timeout, when the link is up); reads never target a NOC
+ * tile, so a hung NOC cannot stall this check.
+ *
+ * Used by POST_RESET (reset.c) as the FIRST MMIO touch after the
+ * vendor ID reappears on the bus, gating all further MMIO (kernel TLB
+ * reprogramming, ARC power-up) on a usable link. Safe there: the
+ * device just answered config cycles, so the link is up and the read
+ * completes - at worst slowly with all-1s.
+ *
+ * Caller holds ArcLock (kernel-window register domain) and has checked
+ * Ctx->TlbRegs / Ctx->KernelTlb are mapped. The check leaves the kernel
+ * window programmed to ARC address 0; arc.c reprograms it on every
+ * access, so no state is disturbed.
+ *
+ * Returns STATUS_SUCCESS or STATUS_IO_DEVICE_ERROR (readback dead or
+ * mismatched).
+ */
+NTSTATUS
+TtWindKernelTlbSanityCheck(
+    _In_ PTTWIND_DEVICE_CONTEXT Ctx
+    )
+{
+    TTWIND_NOC_TLB_CONFIG cfg;
+    UINT64 lo;
+    UINT32 hi;
+    ULONG rb0, rb1, rb2;
+    PUCHAR regs;
+
+    NT_ASSERT(Ctx->TlbRegs != NULL);
+
+    RtlZeroMemory(&cfg, sizeof(cfg));
+    cfg.Addr = 0;
+    cfg.XEnd = 8;      /* ARC tile, matching arc.c's kernel window use */
+    cfg.YEnd = 0;
+    cfg.Noc = 0;
+    cfg.Ordering = 1;  /* strict - guarantees a nonzero readback image */
+
+    TtWindPackTlb2M(&cfg, &lo, &hi);
+    TtWindProgramTlb2M(Ctx, TTWIND_BH_KERNEL_TLB_INDEX, &cfg);
+
+    regs = Ctx->TlbRegs +
+           (TTWIND_BH_KERNEL_TLB_INDEX * TTWIND_BH_TLB_REG_SIZE);
+    rb0 = READ_REGISTER_ULONG((volatile ULONG *)(regs + 0));
+    rb1 = READ_REGISTER_ULONG((volatile ULONG *)(regs + 4));
+    rb2 = READ_REGISTER_ULONG((volatile ULONG *)(regs + 8));
+
+    if (rb0 != (ULONG)lo || rb1 != (ULONG)(lo >> 32) || rb2 != hi) {
+        KdPrint(("ttwind: TLB register readback mismatch "
+                 "(%08X %08X %08X != %08X %08X %08X)\n",
+                 rb0, rb1, rb2,
+                 (ULONG)lo, (ULONG)(lo >> 32), hi));
+        return STATUS_IO_DEVICE_ERROR;
+    }
+    return STATUS_SUCCESS;
 }
 
 /*

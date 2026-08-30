@@ -59,6 +59,8 @@ DEFINE_GUID(GUID_DEVINTERFACE_TTWIND,
     CTL_CODE(TTWIND_DEVICE_TYPE, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_TTWIND_ARC_STATUS \
     CTL_CODE(TTWIND_DEVICE_TYPE, 0x809, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_TTWIND_POST_RESET \
+    CTL_CODE(TTWIND_DEVICE_TYPE, 0x80A, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 /* A PCI device decodes at most six 32-bit BARs. */
 #define TTWIND_MAX_BARS 6u
@@ -260,16 +262,38 @@ typedef struct _TTWIND_SMC_MSG_INOUT {
 /*
  * Input of IOCTL_TTWIND_RESET_DEVICE. No output buffer.
  *
- * v1 is conservative: the reset is refused with STATUS_DEVICE_BUSY while
- * ANY user mapping of device memory exists on any handle (the driver has
- * no way to revoke user page-table entries yet, and a dangling user view
- * of a BAR across a reset is unacceptable). Unmap everything first.
+ * Split reset model (v2, hardened after the 2026-08-30 hard-freeze;
+ * mirrors tt-kmd's arm-then-recover flow): RESET_DEVICE only ARMS the
+ * reset and returns immediately - it never sleeps, polls, or touches
+ * BAR/MMIO space after the arm writes, because on this platform a
+ * driver-side MMIO read during the momentary link-down window stalls
+ * the CPU uninterruptibly and hard-freezes the machine. Recovery is
+ * the separate IOCTL_TTWIND_POST_RESET below.
  *
- * The reset itself is tt-kmd's Blackhole "ASIC reset" mechanism: a write
- * to the device's own config space (DBI interface timer) that makes the
- * chip reset itself; the driver saves/restores config space around it
- * and re-sends the power-up firmware messages afterwards. The PCIe link
- * and the parent bridge are never touched.
+ * What RESET_DEVICE does: refuse-if-busy checks -> bump the reset
+ * generation (invalidating every OTHER open handle; the resetting
+ * handle carries forward) -> reclaim all TLB window allocations ->
+ * save config space -> set the reset marker (PCI COMMAND parity bit,
+ * config write) -> arm the DBI interface-timer (two config writes that
+ * make the chip reset itself; tt-kmd's Blackhole "ASIC reset") ->
+ * enter the RESTRICTED state -> return. The PCIe link and the parent
+ * bridge are never touched, and no MMIO/ARC liveness is probed first -
+ * this reset must be available precisely when MMIO is wedged; only the
+ * config-space vendor ID is checked (all-1s => device already off the
+ * bus => STATUS_DEVICE_DOES_NOT_EXIST, nothing armed).
+ *
+ * It is refused with STATUS_DEVICE_BUSY while ANY user mapping of
+ * device memory exists on any handle (no user-PTE revocation on
+ * Windows yet, and a user read of BAR space during the link-down
+ * window would stall the machine exactly like a kernel one). Unmap
+ * everything first. Re-arming while already restricted is permitted
+ * and idempotent (the original config save is kept).
+ *
+ * RESTRICTED state: until POST_RESET succeeds, only GET_DEVICE_INFO,
+ * RESET_DEVICE, and POST_RESET are accepted; every other ioctl fails
+ * with STATUS_REINITIALIZATION_NEEDED before touching hardware. Stale
+ * handles (opened before the reset) fail everything with
+ * STATUS_DEVICE_REMOVED.
  *
  * Flags and Reserved must be 0.
  */
@@ -277,6 +301,42 @@ typedef struct _TTWIND_RESET_DEVICE_IN {
     unsigned int Flags;          /* must be 0 */
     unsigned int Reserved;       /* must be 0 */
 } TTWIND_RESET_DEVICE_IN;
+
+/*
+ * Input of IOCTL_TTWIND_POST_RESET. No output buffer.
+ *
+ * Completes a reset armed by RESET_DEVICE. Cheap and retryable: call
+ * it repeatedly (e.g. every 100 ms for up to ~10 s) after RESET_DEVICE
+ * until it stops returning STATUS_DEVICE_DOES_NOT_EXIST. It performs,
+ * in order: config-space probe for the device's return (vendor ID) ->
+ * reset-marker check -> full config-space restore (BARs, MSI, PCIe
+ * DevCtl incl. MaxPayload/MaxReadRequest; COMMAND register last) ->
+ * re-save of the restored config -> ONE bounded MMIO sanity readback
+ * (the first MMIO touch since the arm) -> leave the RESTRICTED state
+ * -> best-effort ARC firmware power-up (failures logged, not fatal -
+ * diagnose with ARC_STATUS / retry via SMC_MSG).
+ *
+ * Statuses:
+ *  - STATUS_SUCCESS: recovered (or nothing was pending).
+ *  - STATUS_DEVICE_DOES_NOT_EXIST: device not back on the bus yet;
+ *    still restricted - keep polling.
+ *  - STATUS_UNSUCCESSFUL: the chip ignored the reset trigger (marker
+ *    still set). The device was never disturbed; the restricted state
+ *    is exited and the marker cleared.
+ *  - STATUS_DEVICE_DATA_ERROR: config restore failed/incomplete;
+ *    still restricted - retry.
+ *  - STATUS_IO_DEVICE_ERROR: the device answers config cycles but the
+ *    MMIO sanity readback failed; still restricted - retry, or re-arm
+ *    RESET_DEVICE.
+ * The restricted state is never permanent: POST_RESET can always be
+ * retried, and only PnP removal makes the device dead.
+ *
+ * Flags and Reserved must be 0.
+ */
+typedef struct _TTWIND_POST_RESET_IN {
+    unsigned int Flags;          /* must be 0 */
+    unsigned int Reserved;       /* must be 0 */
+} TTWIND_POST_RESET_IN;
 
 /*
  * Output of IOCTL_TTWIND_ARC_STATUS. No input buffer.
@@ -348,6 +408,7 @@ static_assert(sizeof(TTWIND_MAP_TLB_IN) == 8, "wire size");
 static_assert(sizeof(TTWIND_MAP_TLB_OUT) == 8, "wire size");
 static_assert(sizeof(TTWIND_SMC_MSG_INOUT) == 32, "wire size");
 static_assert(sizeof(TTWIND_RESET_DEVICE_IN) == 8, "wire size");
+static_assert(sizeof(TTWIND_POST_RESET_IN) == 8, "wire size");
 static_assert(sizeof(TTWIND_ARC_STATUS_OUT) == 40, "wire size");
 #else
 C_ASSERT(sizeof(TTWIND_DEVICE_INFO_OUT) == 120);
@@ -363,5 +424,6 @@ C_ASSERT(sizeof(TTWIND_MAP_TLB_IN) == 8);
 C_ASSERT(sizeof(TTWIND_MAP_TLB_OUT) == 8);
 C_ASSERT(sizeof(TTWIND_SMC_MSG_INOUT) == 32);
 C_ASSERT(sizeof(TTWIND_RESET_DEVICE_IN) == 8);
+C_ASSERT(sizeof(TTWIND_POST_RESET_IN) == 8);
 C_ASSERT(sizeof(TTWIND_ARC_STATUS_OUT) == 40);
 #endif

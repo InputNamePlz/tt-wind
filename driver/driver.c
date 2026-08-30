@@ -97,18 +97,21 @@ TtWindEvtDeviceAdd(
     WdfDeviceInitSetIoType(DeviceInit, WdfDeviceIoBuffered);
 
     /*
-     * Per-handle cleanup: every user mapping and TLB window is owned by
+     * Per-handle state: every user mapping and TLB window is owned by
      * the file object that created it, and EvtFileCleanup tears down
-     * whatever the closing handle still holds. No create/close handlers
-     * are needed - the framework's defaults complete those.
+     * whatever the closing handle still holds. EvtDeviceFileCreate
+     * stamps the handle with the device's current reset generation
+     * (see ttwind.h TTWIND_FILE_CONTEXT).
      */
     WDF_FILEOBJECT_CONFIG_INIT(&fileConfig,
-                               WDF_NO_EVENT_CALLBACK, /* create  */
+                               TtWindEvtDeviceFileCreate,
                                WDF_NO_EVENT_CALLBACK, /* close   */
                                TtWindEvtFileCleanup);
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes,
+                                            TTWIND_FILE_CONTEXT);
     WdfDeviceInitSetFileObjectConfig(DeviceInit,
                                      &fileConfig,
-                                     WDF_NO_OBJECT_ATTRIBUTES);
+                                     &attributes);
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, TTWIND_DEVICE_CONTEXT);
 
@@ -147,4 +150,29 @@ TtWindEvtDeviceAdd(
     }
 
     return STATUS_SUCCESS;
+}
+
+/*
+ * TtWindEvtDeviceFileCreate - stamp the new handle with the device's
+ * current reset generation. A handle is "current" until RESET_DEVICE
+ * bumps the device generation; the ioctl dispatcher (queue.c) then
+ * fails everything from stale handles with STATUS_DEVICE_REMOVED.
+ *
+ * The plain 64-bit read is safe: aligned, and a create racing a reset
+ * at worst captures the pre-bump value, making the handle immediately
+ * stale - the same outcome as opening just before the reset.
+ */
+VOID
+TtWindEvtDeviceFileCreate(
+    _In_ WDFDEVICE Device,
+    _In_ WDFREQUEST Request,
+    _In_ WDFFILEOBJECT FileObject
+    )
+{
+    PTTWIND_DEVICE_CONTEXT ctx = TtWindGetDeviceContext(Device);
+
+    TtWindGetFileContext(FileObject)->ResetGeneration =
+        ctx->ResetGeneration;
+
+    WdfRequestComplete(Request, STATUS_SUCCESS);
 }

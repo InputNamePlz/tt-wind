@@ -110,11 +110,46 @@ TtWindEvtIoDeviceControl(
     )
 {
     WDFDEVICE device = WdfIoQueueGetDevice(Queue);
+    PTTWIND_DEVICE_CONTEXT ctx = TtWindGetDeviceContext(device);
+    WDFFILEOBJECT fileObject = WdfRequestGetFileObject(Request);
     size_t bytesWritten = 0;
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(OutputBufferLength);
     UNREFERENCED_PARAMETER(InputBufferLength);
+
+    /*
+     * Reset-generation fence: a handle opened before the most recent
+     * armed reset is stale - the reset reclaimed its TLB windows and
+     * invalidated its view of the device. Every ioctl from it fails as
+     * device-gone; the handle that issued the reset was carried forward
+     * to the current generation and passes. Reading the generation and
+     * NeedsHwInit without a lock is safe: both are only written by the
+     * reset ioctls, which run on this same sequential queue.
+     */
+    if (fileObject != NULL &&
+        TtWindGetFileContext(fileObject)->ResetGeneration !=
+            ctx->ResetGeneration) {
+        WdfRequestComplete(Request, STATUS_DEVICE_REMOVED);
+        return;
+    }
+
+    /*
+     * Restricted state (armed reset not yet recovered, see reset.c):
+     * the device may be off the bus, and on this platform an MMIO read
+     * during link-down stalls the machine (incident 2026-08-30). Only
+     * the allow-list below may proceed; everything else - anything that
+     * could touch MMIO or hand out a mapping of it - fails BEFORE
+     * touching hardware, with a distinct, retryable status. Recovery:
+     * poll IOCTL_TTWIND_POST_RESET.
+     */
+    if (ctx->NeedsHwInit &&
+        IoControlCode != IOCTL_TTWIND_GET_DEVICE_INFO &&
+        IoControlCode != IOCTL_TTWIND_RESET_DEVICE &&
+        IoControlCode != IOCTL_TTWIND_POST_RESET) {
+        WdfRequestComplete(Request, STATUS_REINITIALIZATION_NEEDED);
+        return;
+    }
 
     switch (IoControlCode) {
     case IOCTL_TTWIND_GET_DEVICE_INFO:
@@ -151,6 +186,10 @@ TtWindEvtIoDeviceControl(
 
     case IOCTL_TTWIND_RESET_DEVICE:
         status = TtWindIoctlResetDevice(device, Request);
+        break;
+
+    case IOCTL_TTWIND_POST_RESET:
+        status = TtWindIoctlPostReset(device, Request);
         break;
 
     case IOCTL_TTWIND_ARC_STATUS:

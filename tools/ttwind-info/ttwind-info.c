@@ -21,8 +21,9 @@
  *                          observations (boot status via all candidate
  *                          routes, selected route, QCB pointer, queue
  *                          geometry).
- *   reset                  IOCTL_TTWIND_RESET_DEVICE (refused while any
- *                          user mapping exists).
+ *   reset                  IOCTL_TTWIND_RESET_DEVICE (arm; refused while
+ *                          any user mapping exists) then poll
+ *                          IOCTL_TTWIND_POST_RESET until recovery.
  * Numeric arguments accept 0x-prefixed hex.
  */
 
@@ -634,15 +635,22 @@ out_close:
 }
 
 /*
- * reset: IOCTL_TTWIND_RESET_DEVICE. The driver refuses with
- * ERROR_BUSY while any user mapping of device memory exists; the call
- * blocks (up to ~15 s worst case) while the device resets, config
- * space is restored, and firmware power-up messages are re-sent.
+ * reset: the split arm/recover flow (driver 100.3.4.0+). RESET_DEVICE
+ * only ARMS the chip's self-reset and returns immediately (the driver
+ * never sleeps or touches MMIO while the device may be off the bus -
+ * the 2026-08-30 hard-freeze fix); this tool then polls POST_RESET
+ * (config-space probe + config restore + MMIO gate + firmware
+ * power-up) about every 100 ms until it succeeds, ~15 s bound.
+ * RESET_DEVICE is refused with ERROR_BUSY while any user mapping of
+ * device memory exists.
  */
 static int cmd_reset(void)
 {
     TTWIND_RESET_DEVICE_IN reset_in;
+    TTWIND_POST_RESET_IN post_in;
     DWORD returned = 0;
+    DWORD err;
+    DWORD waited;
     HANDLE h;
     int rc = 2;
 
@@ -651,15 +659,39 @@ static int cmd_reset(void)
         return 2;
 
     memset(&reset_in, 0, sizeof(reset_in));
-    printf("Resetting device (this can take several seconds)...\n");
+    printf("Arming device reset...\n");
     if (!DeviceIoControl(h, IOCTL_TTWIND_RESET_DEVICE, &reset_in,
                          sizeof(reset_in), NULL, 0, &returned, NULL)) {
         print_win32_error("RESET_DEVICE failed", GetLastError());
-    } else {
-        printf("Reset complete.\n");
-        rc = 0;
+        goto out_close;
     }
 
+    memset(&post_in, 0, sizeof(post_in));
+    printf("Waiting for the device to return (polling POST_RESET)...\n");
+    for (waited = 0; ; waited += 100) {
+        if (DeviceIoControl(h, IOCTL_TTWIND_POST_RESET, &post_in,
+                            sizeof(post_in), NULL, 0, &returned, NULL)) {
+            printf("Reset complete.\n");
+            rc = 0;
+            break;
+        }
+        err = GetLastError();
+        if (err == ERROR_GEN_FAILURE) {
+            /* STATUS_UNSUCCESSFUL: the chip ignored the reset trigger;
+             * the device was never disturbed. Retrying would report a
+             * hollow success, so stop here. */
+            fprintf(stderr, "device ignored the reset trigger\n");
+            rc = 1;
+            break;
+        }
+        if (waited >= 15000) {
+            print_win32_error("POST_RESET failed", err);
+            break;
+        }
+        Sleep(100);
+    }
+
+out_close:
     CloseHandle(h);
     return rc;
 }

@@ -14,6 +14,13 @@
 #define TTWIND_POOL_TAG 'dnWT' /* "TWnd" in the pool viewer */
 
 /*
+ * How much PCI config space RESET_DEVICE saves and POST_RESET restores
+ * (the standard header plus the capability chain where Blackhole keeps
+ * its MSI/PCIe caps; extended >0x100 capabilities revert to defaults).
+ */
+#define TTWIND_PCI_CFG_SAVE_BYTES 256u
+
+/*
  * Blackhole TLB geometry (from tt-kmd blackhole.c). BAR0 starts with 202
  * 2 MiB windows; the TLB configuration registers live at BAR0 offset
  * 0x1FC00000, 12 bytes per window (2 MiB windows first, then the eight
@@ -155,6 +162,57 @@ typedef struct _TTWIND_DEVICE_CONTEXT {
     UINT32 ArcRoute;
 
     /*
+     * NeedsHwInit - TRUE from the moment RESET_DEVICE arms the DBI
+     * reset timer until POST_RESET completes the recovery (config
+     * restore + first bounded MMIO readback). While TRUE the device is
+     * in the RESTRICTED state: the ioctl dispatcher (queue.c) allows
+     * only GET_DEVICE_INFO, RESET_DEVICE, and POST_RESET; every other
+     * ioctl fails with STATUS_REINITIALIZATION_NEEDED BEFORE touching
+     * hardware, and the ARC mailbox path (arc.c, which also serves the
+     * SelfManagedIo power callbacks) refuses likewise under ArcLock.
+     * The state is always recoverable by a (retryable) POST_RESET -
+     * never permanently dead; only PnP removal is dead.
+     *
+     * Why MMIO is forbidden while restricted (incident 2026-08-30):
+     * with a wedged chip, a reset was issued; the DBI arm write landed,
+     * the chip dropped off the bus, and a subsequent driver-side MMIO
+     * read hit the link-down window. This platform STALLS such reads
+     * instead of synthesizing all-1s - the CPU sticks at an
+     * uninterruptible MMIO access and the machine hard-freezes with no
+     * bugcheck (Kernel-Power 41, no minidump). Config-space accesses
+     * (GetBusData/SetBusData) remain safe - config reads to a missing
+     * device return all-1s from the root complex - so the whole
+     * arm-to-recovery window is config-space-only by construction.
+     *
+     * Synchronization: written by RESET_DEVICE/POST_RESET under
+     * ArcLock on the sequential ioctl queue; read by the dispatcher on
+     * the same sequential queue (no race) and by the ARC mailbox path
+     * under ArcLock.
+     */
+    BOOLEAN NeedsHwInit;
+
+    /*
+     * Reset generation. Bumped (under StateLock) every time
+     * RESET_DEVICE arms a reset. Each open handle captures the value
+     * current at create time (TTWIND_FILE_CONTEXT); the dispatcher
+     * fails every ioctl from a stale-generation handle with
+     * STATUS_DEVICE_REMOVED. The handle that issued the reset is
+     * carried forward to the new generation and stays usable.
+     */
+    UINT64 ResetGeneration;
+
+    /*
+     * Saved PCI config space (first TTWIND_PCI_CFG_SAVE_BYTES: header +
+     * capability chain) for POST_RESET to restore. Captured by
+     * RESET_DEVICE just before arming (only when not already
+     * restricted, so a re-arm never overwrites the good save with
+     * post-reset defaults) and refreshed after every successful
+     * restore. Guarded by ArcLock.
+     */
+    UINT32  SavedConfig[TTWIND_PCI_CFG_SAVE_BYTES / 4];
+    BOOLEAN SavedConfigValid;
+
+    /*
      * Config-space access to this function via the parent bus driver.
      * Queried (referenced) at PrepareHardware, dereferenced at
      * ReleaseHardware. Valid only while BusIfValid.
@@ -176,9 +234,26 @@ typedef struct _TTWIND_DEVICE_CONTEXT {
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(TTWIND_DEVICE_CONTEXT, TtWindGetDeviceContext)
 
+/*
+ * Per-handle (WDFFILEOBJECT) context.
+ *
+ * ResetGeneration is the device's reset generation captured when the
+ * handle was opened (EvtDeviceFileCreate, driver.c). A RESET_DEVICE
+ * bumps the device generation, making every other open handle stale:
+ * the dispatcher (queue.c) fails all their ioctls with
+ * STATUS_DEVICE_REMOVED so no stale handle can touch the device across
+ * a reset. The resetting handle itself is moved to the new generation.
+ */
+typedef struct _TTWIND_FILE_CONTEXT {
+    UINT64 ResetGeneration;
+} TTWIND_FILE_CONTEXT, *PTTWIND_FILE_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(TTWIND_FILE_CONTEXT, TtWindGetFileContext)
+
 /* driver.c */
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD TtWindEvtDeviceAdd;
+EVT_WDF_DEVICE_FILE_CREATE TtWindEvtDeviceFileCreate;
 
 /* device.c */
 EVT_WDF_DEVICE_PREPARE_HARDWARE TtWindEvtDevicePrepareHardware;
@@ -210,6 +285,7 @@ NTSTATUS TtWindIoctlMapTlb(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request,
                            _Out_ size_t *BytesWritten);
 VOID TtWindProgramTlb2M(_In_ PTTWIND_DEVICE_CONTEXT Ctx, _In_ UINT32 TlbId,
                         _In_ const TTWIND_NOC_TLB_CONFIG *Cfg);
+NTSTATUS TtWindKernelTlbSanityCheck(_In_ PTTWIND_DEVICE_CONTEXT Ctx);
 
 /* arc.c */
 EVT_WDF_DEVICE_SELF_MANAGED_IO_INIT TtWindEvtDeviceSelfManagedIoInit;
@@ -226,3 +302,4 @@ NTSTATUS TtWindIoctlArcStatus(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request,
 
 /* reset.c */
 NTSTATUS TtWindIoctlResetDevice(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request);
+NTSTATUS TtWindIoctlPostReset(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request);

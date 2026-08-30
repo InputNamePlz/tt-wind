@@ -643,6 +643,23 @@ TtWindArcMsgSendSync(
 
     WdfWaitLockAcquire(ctx->ArcLock, NULL);
 
+    /*
+     * Restricted state (armed reset not yet recovered, see reset.c):
+     * every access below is MMIO through BAR0 (kernel TLB window / TLB
+     * registers / APB aperture), and while the reset is in flight the
+     * device may be off the bus - on this platform such a read stalls
+     * the CPU uninterruptibly (incident 2026-08-30). Fail cleanly
+     * without touching the BARs. The ioctl dispatcher already blocks
+     * SMC_MSG etc.; this check is the guard for the paths that do NOT
+     * go through dispatch - the SelfManagedIo suspend/restart power
+     * callbacks and POST_RESET's own power-up (which clears NeedsHwInit
+     * before calling in).
+     */
+    if (ctx->NeedsHwInit) {
+        status = STATUS_REINITIALIZATION_NEEDED;
+        goto out;
+    }
+
     if (ctx->KernelTlb == NULL || ctx->TlbRegs == NULL) {
         status = STATUS_DEVICE_NOT_READY;
         goto out;
@@ -926,7 +943,17 @@ TtWindIoctlArcStatus(
 
     WdfWaitLockAcquire(ctx->ArcLock, NULL);
 
-    if (ctx->KernelTlb == NULL || ctx->TlbRegs == NULL) {
+    if (ctx->NeedsHwInit) {
+        /*
+         * Restricted state: the dispatcher normally blocks ARC_STATUS
+         * while a reset is in flight; this is defense in depth for the
+         * window where dispatch raced the arm. The discovery probe is
+         * MMIO and the device may be off the bus - report without
+         * touching the BARs (incident 2026-08-30, reset.c).
+         */
+        report.Stage = TTWIND_ARC_STAGE_NOT_STARTED;
+        report.LastStatus = (unsigned int)STATUS_REINITIALIZATION_NEEDED;
+    } else if (ctx->KernelTlb == NULL || ctx->TlbRegs == NULL) {
         report.Stage = TTWIND_ARC_STAGE_NOT_STARTED;
         report.LastStatus = (unsigned int)STATUS_DEVICE_NOT_READY;
     } else {
