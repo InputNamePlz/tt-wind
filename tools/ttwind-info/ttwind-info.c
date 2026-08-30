@@ -15,6 +15,10 @@
  *                          for a NOC0 unicast to (x, y) at addr's 2 MiB
  *                          block, MAP_TLB UC, read a u32 at addr within
  *                          the window, print it, unmap, free.
+ *   arcmsg <hdr> [w1..w7]  Send a raw 8x u32 ARC (SMC) firmware message
+ *                          (missing words are 0), print the response.
+ *   reset                  IOCTL_TTWIND_RESET_DEVICE (refused while any
+ *                          user mapping exists).
  * Numeric arguments accept 0x-prefixed hex.
  */
 
@@ -348,12 +352,108 @@ out_close:
     return rc;
 }
 
+/*
+ * arcmsg <hdr> [w1..w7]: one synchronous ARC (SMC) firmware message.
+ * Word 0 is the header (message type in the low byte); unspecified
+ * words are zero. Prints the raw 8-word response; the firmware status
+ * is response word 0 (0 = success).
+ *
+ * A safe read-only smoke test is the firmware's TEST message, type
+ * 0x90 (tt-kmd uses it as a pure liveness check): `arcmsg 0x90`
+ * should return status 0.
+ */
+static int cmd_arcmsg(int argc, char **argv)
+{
+    TTWIND_SMC_MSG_INOUT msg_in;
+    TTWIND_SMC_MSG_INOUT msg_out;
+    DWORD returned = 0;
+    HANDLE h;
+    int i;
+    int rc = 2;
+
+    memset(&msg_in, 0, sizeof(msg_in));
+    for (i = 0; i < argc; i++) {
+        unsigned __int64 word;
+
+        if (parse_u64(argv[i], &word))
+            return 2;
+        if (word > 0xFFFFFFFFull) {
+            fprintf(stderr, "word %d ('%s') does not fit in 32 bits\n",
+                    i, argv[i]);
+            return 2;
+        }
+        msg_in.Message[i] = (unsigned int)word;
+    }
+
+    h = open_first_device();
+    if (h == INVALID_HANDLE_VALUE)
+        return 2;
+
+    printf("request : ");
+    for (i = 0; i < 8; i++)
+        printf("%08x%s", msg_in.Message[i], i == 7 ? "\n" : " ");
+
+    if (!DeviceIoControl(h, IOCTL_TTWIND_SMC_MSG, &msg_in, sizeof(msg_in),
+                         &msg_out, sizeof(msg_out), &returned, NULL)) {
+        print_win32_error("SMC_MSG failed", GetLastError());
+        goto out_close;
+    }
+    if (returned < sizeof(msg_out)) {
+        fprintf(stderr, "short SMC_MSG reply: %lu bytes\n", returned);
+        goto out_close;
+    }
+
+    printf("response: ");
+    for (i = 0; i < 8; i++)
+        printf("%08x%s", msg_out.Message[i], i == 7 ? "\n" : " ");
+    printf("firmware status: 0x%08x (%s)\n", msg_out.Message[0],
+           msg_out.Message[0] == 0 ? "ok" : "error");
+    rc = 0;
+
+out_close:
+    CloseHandle(h);
+    return rc;
+}
+
+/*
+ * reset: IOCTL_TTWIND_RESET_DEVICE. The driver refuses with
+ * ERROR_BUSY while any user mapping of device memory exists; the call
+ * blocks (up to ~15 s worst case) while the device resets, config
+ * space is restored, and firmware power-up messages are re-sent.
+ */
+static int cmd_reset(void)
+{
+    TTWIND_RESET_DEVICE_IN reset_in;
+    DWORD returned = 0;
+    HANDLE h;
+    int rc = 2;
+
+    h = open_first_device();
+    if (h == INVALID_HANDLE_VALUE)
+        return 2;
+
+    memset(&reset_in, 0, sizeof(reset_in));
+    printf("Resetting device (this can take several seconds)...\n");
+    if (!DeviceIoControl(h, IOCTL_TTWIND_RESET_DEVICE, &reset_in,
+                         sizeof(reset_in), NULL, 0, &returned, NULL)) {
+        print_win32_error("RESET_DEVICE failed", GetLastError());
+    } else {
+        printf("Reset complete.\n");
+        rc = 0;
+    }
+
+    CloseHandle(h);
+    return rc;
+}
+
 static int usage(void)
 {
     fprintf(stderr,
             "usage: ttwind-info                       list devices\n"
             "       ttwind-info bar0read <offset>     read u32 from BAR0\n"
-            "       ttwind-info tlbread <x> <y> <addr> read u32 via TLB window\n");
+            "       ttwind-info tlbread <x> <y> <addr> read u32 via TLB window\n"
+            "       ttwind-info arcmsg <hdr> [w1..w7] send raw ARC/SMC message\n"
+            "       ttwind-info reset                 reset the device\n");
     return 2;
 }
 
@@ -368,6 +468,10 @@ int main(int argc, char **argv)
             return cmd_bar0read(argv[2]);
         if (strcmp(argv[1], "tlbread") == 0 && argc == 5)
             return cmd_tlbread(argv[2], argv[3], argv[4]);
+        if (strcmp(argv[1], "arcmsg") == 0 && argc >= 3 && argc <= 10)
+            return cmd_arcmsg(argc - 2, argv + 2);
+        if (strcmp(argv[1], "reset") == 0 && argc == 2)
+            return cmd_reset();
         return usage();
     }
 
